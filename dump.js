@@ -214,6 +214,8 @@ function getAllAppModules() {
     var tmpmods = [];
     if (typeof Process.enumerateModulesSync === 'function') {
         tmpmods = Process.enumerateModulesSync();
+    } else {
+        tmpmods = Process.enumerateModules();
     }
     for (var i = 0; i < tmpmods.length; i++) {
         // console.log("Check module: " + tmpmods[i].path);
@@ -236,16 +238,7 @@ function getAllAppModules() {
             modules.push(mainMod);
         }
     }
-    if (modules.length === 0) {
-        console.log("[frida-ios-dump]: Modules still empty. Trying Process.findModuleByName('WhatsApp')...");
-        var m = Process.findModuleByName("WhatsApp");
-        if (m) {
-            console.log("[frida-ios-dump]: HARD FALLBACK SUCCESS: Found module: " + m.path);
-            modules.push(m);
-        } else {
-            console.log("[frida-ios-dump]: HARD FALLBACK FAILED: Process.findModuleByName('WhatsApp') returned null");
-        }
-    }
+
     return modules;
 }
 
