@@ -99,5 +99,16 @@ python3 dump.py -p 2222 -o WeChat_Decrypted.ipa com.tencent.xin
 *   请尝试**先在手机上并手动打开 App**，保持在前台运行，然后再运行脚本。
 *   确保手机屏幕没有锁定。
 
+
+## 成功验证案例 (Verified Cases)
+
+以下应用已使用本工具成功砸壳并验证：
+
+| 应用名称 | Bundle ID | 验证时间 | 备注 |
+| :--- | :--- | :--- | :--- |
+| **WhatsApp** | `net.whatsapp.WhatsApp` | 2026-02-03 | 基础兼容性测试通过 |
+| **InspectorVpn** | `com.github.zhkl0228.inspector.vpn` | 2026-02-03 | 验证了新版 Frida 模块枚举修复 |
+| **Telegram** | `org.telegram.Telegram` | 2026-02-03 | 大体积 IPA 验证通过 |
+
 ---
 Happy Hacking!

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Modified by: Gemini
+# Modified by: jts
 # Fixes: 0.00B stuck issue by using system SCP + Correct Password
 
 from __future__ import print_function
@@ -22,7 +22,7 @@ import paramiko
 
 # ---------------- 配置区域 ----------------
 User = 'root'
-# ✅ 已更正为你设置的密码
+# ✅ 更正为你设置的密码
 Password = '88888888'
 Host = '127.0.0.1'
 Port = 2222
