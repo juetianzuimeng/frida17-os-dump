@@ -1,5 +1,39 @@
+# System files
 .DS_Store
-.idea
-*.ipa
+Thumbs.db
 
-frida/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+venv_*/
+.env
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+
+# Project specific
+# IPAs (Copyrighted binaries)
+*.ipa
+*.zip
+
+# Intermediate build artifacts
+Payload/
+temp/
+temp_check/
+temp_verification/
+*.fid
+
+# Logs and sensitive info
+手机连接信息.txt
+*.log
+
+# User specific output
+WhatsApp_decrypted.ipa
+.gitignore
