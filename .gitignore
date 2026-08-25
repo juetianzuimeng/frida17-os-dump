@@ -26,14 +26,14 @@ venv_*/
 # Intermediate build artifacts
 Payload/
 temp/
-temp_check/
-temp_verification/
+temp_*/
 *.fid
+
+# Theos build artifacts & test tweaks
+.theos/
+packages/
+*Bypass/
 
 # Logs and sensitive info
 手机连接信息.txt
 *.log
-
-# User specific output
-WhatsApp_decrypted.ipa
-.gitignore
