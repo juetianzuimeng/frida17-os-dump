@@ -1,30 +1,4 @@
-console.log("[frida-ios-dump]: Script loaded");
-
-rpc.exports = {
-    startDump: handleMessage
-};
-
-function handleMessage(message) {
-    console.log("[frida-ios-dump]: handleMessage called");
-    try {
-        Module.ensureInitialized('Foundation');
-    } catch (e) {
-        console.log("[frida-ios-dump]: Foundation init failed: " + e);
-    }
-
-    modules = getAllAppModules();
-    var app_path = ObjC.classes.NSBundle.mainBundle().bundlePath();
-    // loadAllDynamicLibrary(app_path);
-    // start dump
-    modules = getAllAppModules();
-    for (var i = 0; i < modules.length; i++) {
-        console.log("start dump " + modules[i].path);
-        var result = dumpModule(modules[i].path);
-        send({ dump: result, path: modules[i].path });
-    }
-    send({ app: app_path.toString() });
-    send({ done: "ok" });
-}
+console.log("[frida-ios-dump]: Script loaded (USB Mode)");
 
 
 var O_RDONLY = 0;
@@ -70,12 +44,11 @@ function putU16(addr, n) {
 
 function getU32(addr) {
     if (typeof addr == "number") addr = ptr(addr);
-    // return addr.readU32(); // Broken on some buffers?
     var b0 = addr.readU8();
     var b1 = addr.add(1).readU8();
     var b2 = addr.add(2).readU8();
     var b3 = addr.add(3).readU8();
-    return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    return ((b3 << 24) | (b2 << 16) | (b1 << 8) | b0) >>> 0;
 }
 
 function putU32(addr, n) {
@@ -109,77 +82,117 @@ function malloc(size) {
 }
 
 function getExportFunction(type, name, ret, args) {
-    var nptr;
-    nptr = Module.findExportByName(null, name);
-    if (nptr === null) {
-        nptr = Module.findExportByName("libSystem.B.dylib", name);
-    }
-    if (nptr === null) {
-        console.log("cannot find " + name);
-        return null;
-    } else {
-        if (type === "f") {
-            var funclet = new NativeFunction(nptr, ret, args);
-            if (typeof funclet === "undefined") {
-                console.log("parse error " + name);
-                return null;
-            }
-            console.log("[frida-ios-dump]: Resolved " + name + " at " + nptr);
-            return funclet;
-        } else if (type === "d") {
-            var datalet = nptr.readPointer();
-            if (typeof datalet === "undefined") {
-                console.log("parse error " + name);
-                return null;
-            }
-            return datalet;
+    try {
+        var nptr;
+        nptr = Module.findExportByName(null, name);
+        if (nptr === null) {
+            nptr = Module.findExportByName("libSystem.B.dylib", name);
         }
+        if (nptr === null) {
+            console.log("cannot find " + name);
+            return null;
+        } else {
+            if (type === "f") {
+                var funclet = new NativeFunction(nptr, ret, args);
+                if (typeof funclet === "undefined") {
+                    console.log("parse error " + name);
+                    return null;
+                }
+                return funclet;
+            } else if (type === "d") {
+                var datalet = nptr.readPointer();
+                if (typeof datalet === "undefined") {
+                    console.log("parse error " + name);
+                    return null;
+                }
+                return datalet;
+            }
+        }
+    } catch (e) {
+        console.log("[frida-ios-dump]: getExportFunction failed for " + name + ": " + e);
+        return null;
     }
 }
 
-var NSSearchPathForDirectoriesInDomains = getExportFunction("f", "NSSearchPathForDirectoriesInDomains", "pointer", ["int", "int", "int"]);
+var NSSearchPathForDirectoriesInDomains = null;
+try {
+    NSSearchPathForDirectoriesInDomains = getExportFunction("f", "NSSearchPathForDirectoriesInDomains", "pointer", ["int", "int", "int"]);
+} catch (e) {
+    console.log("[frida-ios-dump]: NSSearchPathForDirectoriesInDomains init failed: " + e);
+}
 
 function resolveLibcFunc(name, ret, args) {
-    var ptr = null;
-    // Strategy 1: Module.findExportByName (Old Frida)
-    if (typeof Module.findExportByName === 'function') {
-        ptr = Module.findExportByName(null, name);
-        if (!ptr) ptr = Module.findExportByName(null, "_" + name);
-    }
-    // Strategy 2: Module.getExportByName (New Frida) - not showing in keys but might exist? 
-    // Strategy 3: Module.getGlobalExportByName (New Frida 17+?)
-    else if (typeof Module.getGlobalExportByName === 'function') {
-        try { ptr = Module.getGlobalExportByName(name); } catch (e) { }
-        if (!ptr) try { ptr = Module.getGlobalExportByName("_" + name); } catch (e) { }
-    }
+    try {
+        var ptr = null;
+        // Strategy 1: Module.findExportByName (Old Frida)
+        if (typeof Module.findExportByName === 'function') {
+            ptr = Module.findExportByName(null, name);
+            if (!ptr) ptr = Module.findExportByName(null, "_" + name);
+        }
+        // Strategy 2: Module.getGlobalExportByName (New Frida 17+?)
+        else if (typeof Module.getGlobalExportByName === 'function') {
+            try { ptr = Module.getGlobalExportByName(name); } catch (e) { }
+            if (!ptr) try { ptr = Module.getGlobalExportByName("_" + name); } catch (e) { }
+        }
 
-    // Strategy 4: Explicit libSystem search
-    if (!ptr) {
-        try {
-            var lib = Process.findModuleByName("libSystem.B.dylib");
-            if (lib) {
-                ptr = lib.findExportByName(name);
-                if (!ptr) ptr = lib.findExportByName("_" + name);
-            }
-        } catch (e) { }
-    }
+        // Strategy 3: Explicit libSystem search
+        if (!ptr) {
+            try {
+                var lib = Process.findModuleByName("libSystem.B.dylib");
+                if (lib) {
+                    ptr = lib.findExportByName(name);
+                    if (!ptr) ptr = lib.findExportByName("_" + name);
+                }
+            } catch (e) { }
+        }
 
-    if (!ptr) {
-        console.log("[frida-ios-dump] FATAL: Cannot resolve " + name);
+        if (!ptr) {
+            console.log("[frida-ios-dump] WARN: Cannot resolve " + name);
+            return null;
+        }
+        return new NativeFunction(ptr, ret, args);
+    } catch (e) {
+        console.log("[frida-ios-dump] ERROR resolving " + name + ": " + e);
         return null;
     }
-    console.log("[frida-ios-dump] Resolved " + name + " to " + ptr);
-    return new NativeFunction(ptr, ret, args);
 }
 
-var wrapper_open = resolveLibcFunc("open", "int", ["pointer", "int", "int"]);
-var read = resolveLibcFunc("read", "int", ["int", "pointer", "int"]);
-var write = resolveLibcFunc("write", "int", ["int", "pointer", "int"]);
-var lseek = resolveLibcFunc("lseek", "int64", ["int", "int64", "int"]);
-var close = resolveLibcFunc("close", "int", ["int"]);
-var remove = resolveLibcFunc("remove", "int", ["pointer"]);
-var access = resolveLibcFunc("access", "int", ["pointer", "int"]);
-var dlopen = resolveLibcFunc("dlopen", "pointer", ["pointer", "int"]);
+var wrapper_open = null, read = null, write = null, lseek = null;
+var close = null, remove = null, access = null, dlopen = null;
+var popen_func = null, fgets_func = null, pclose_func = null;
+
+try {
+    wrapper_open = resolveLibcFunc("open", "int", ["pointer", "int", "int"]);
+    read = resolveLibcFunc("read", "int", ["int", "pointer", "int"]);
+    write = resolveLibcFunc("write", "int", ["int", "pointer", "int"]);
+    lseek = resolveLibcFunc("lseek", "int64", ["int", "int64", "int"]);
+    close = resolveLibcFunc("close", "int", ["int"]);
+    remove = resolveLibcFunc("remove", "int", ["pointer"]);
+    access = resolveLibcFunc("access", "int", ["pointer", "int"]);
+    dlopen = resolveLibcFunc("dlopen", "pointer", ["pointer", "int"]);
+    popen_func = resolveLibcFunc("popen", "pointer", ["pointer", "pointer"]);
+    fgets_func = resolveLibcFunc("fgets", "pointer", ["pointer", "int", "pointer"]);
+    pclose_func = resolveLibcFunc("pclose", "int", ["pointer"]);
+    console.log("[frida-ios-dump]: All libc functions resolved.");
+} catch (e) {
+    console.log("[frida-ios-dump]: libc resolution error: " + e);
+}
+
+function popenRead(cmd) {
+    if (!popen_func || !fgets_func || !pclose_func) {
+        console.log("[frida-ios-dump]: popen/fgets/pclose not available");
+        return "";
+    }
+    var fp = popen_func(allocStr(cmd), allocStr("r"));
+    if (fp.isNull()) return "";
+    var buf = malloc(4096);
+    var result = "";
+    while (!fgets_func(buf, 4096, fp).isNull()) {
+        result += buf.readUtf8String();
+    }
+    pclose_func(fp);
+    return result;
+}
 
 
 function getDocumentDir() {
@@ -242,16 +255,6 @@ function getAllAppModules() {
     return modules;
 }
 
-var FAT_MAGIC = 0xcafebabe;
-var FAT_CIGAM = 0xbebafeca;
-var MH_MAGIC = 0xfeedface;
-var MH_CIGAM = 0xcefaedfe;
-var MH_MAGIC_64 = 0xfeedfacf;
-var MH_CIGAM_64 = 0xcffaedfe;
-var LC_SEGMENT = 0x1;
-var LC_SEGMENT_64 = 0x19;
-var LC_ENCRYPTION_INFO = 0x21;
-var LC_ENCRYPTION_INFO_64 = 0x2C;
 
 function pad(str, n) {
     return Array(n - str.length + 1).join("0") + str;
@@ -332,12 +335,11 @@ function dumpModule(name) {
 
     // Debug for mismatch
     if (size_of_mach_header == 0) {
-        console.log("[frida-ios-dump]: Magic mismatch! magic=" + magic + " (" + magic.toString(16) + "), MH_MAGIC_64=" + MH_MAGIC_64);
-        if (magic.toString(16) == "feedfacf") {
-            console.log("[frida-ios-dump]: Forced 64-bit match.");
-            size_of_mach_header = 32;
-            is64bit = true;
-        }
+        console.log("[frida-ios-dump]: Magic mismatch! magic=0x" + magic.toString(16) + ", expected MH_MAGIC_64=0x" + MH_MAGIC_64.toString(16));
+        // 强制判断 (有符号/无符号兼容)
+        console.log("[frida-ios-dump]: Forced 64-bit match.");
+        size_of_mach_header = 32;
+        is64bit = true;
     }
 
     console.log("[frida-ios-dump]: Resuming dump logic...");
@@ -366,7 +368,7 @@ function dumpModule(name) {
         var b1 = addr.add(1).readU8();
         var b2 = addr.add(2).readU8();
         var b3 = addr.add(3).readU8();
-        return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+        return ((b3 << 24) | (b2 << 16) | (b1 << 8) | b0) >>> 0;
     }
     console.log("[frida-ios-dump]: Manual read at 0: " + getU32Manual(buffer).toString(16));
     console.log("[frida-ios-dump]: Manual read at 16: " + getU32Manual(buffer.add(16)).toString(16));
@@ -647,15 +649,89 @@ function handleMessage(message) {
         modules = getAllAppModules();
     }
 
+    var dumpResults = [];
     for (var i = 0; i < modules.length; i++) {
-        console.log("start dump " + modules[i].path);
+        console.log("[frida-ios-dump]: Dumping module " + (i + 1) + "/" + modules.length + ": " + modules[i].name);
         var result = dumpModule(modules[i].path);
-        send({ dump: result, path: modules[i].path });
+        if (result) {
+            dumpResults.push({dump: result, path: modules[i].path});
+        }
     }
-    send({ app: app_path.toString() });
-    send({ done: "ok" });
+    console.log("[frida-ios-dump]: Dump complete. " + dumpResults.length + " modules processed.");
+    return {
+        modules: dumpResults,
+        appPath: app_path ? app_path.toString() : null
+    };
 }
 
 rpc.exports = {
-    startDump: handleMessage
+    startDump: handleMessage,
+    readFileChunk: function(path, offset, size) {
+        var fd = open(path, O_RDONLY, 0);
+        if (fd === -1) {
+            console.log("[frida-ios-dump]: Cannot open file: " + path);
+            return null;
+        }
+        lseek(fd, offset, SEEK_SET);
+        var buf = malloc(size);
+        var n = read(fd, buf, size);
+        close(fd);
+        if (n <= 0) return null;
+        return buf.readByteArray(n);
+    },
+    getFileSize: function(path) {
+        var fd = open(path, O_RDONLY, 0);
+        if (fd === -1) return -1;
+        var size = lseek(fd, 0, SEEK_END);
+        close(fd);
+        return Number(size);
+    },
+    listFiles: function(dirPath) {
+        console.log("[frida-ios-dump]: listFiles called for: " + dirPath);
+        // 优先尝试 popen find
+        var output = popenRead("find '" + dirPath + "' -type f 2>/dev/null");
+        if (output && output.trim().length > 0) {
+            var files = output.trim().split("\n").filter(function(p) { return p.length > 0; });
+            console.log("[frida-ios-dump]: listFiles via find: " + files.length + " files");
+            return files;
+        }
+        // 回退：通过 opendir/readdir 递归遍历
+        console.log("[frida-ios-dump]: find failed, falling back to opendir/readdir");
+        var opendir_func = null, readdir_func = null, closedir_func = null;
+        try {
+            var lib = Process.findModuleByName("libSystem.B.dylib");
+            if (lib) {
+                opendir_func = new NativeFunction(lib.findExportByName("opendir"), 'pointer', ['pointer']);
+                readdir_func = new NativeFunction(lib.findExportByName("readdir"), 'pointer', ['pointer']);
+                closedir_func = new NativeFunction(lib.findExportByName("closedir"), 'int', ['pointer']);
+            }
+        } catch (e) {
+            console.log("[frida-ios-dump]: Cannot resolve opendir/readdir: " + e);
+            return [];
+        }
+        if (!opendir_func || !readdir_func || !closedir_func) return [];
+
+        var allFiles = [];
+        function walkDir(path) {
+            var dp = opendir_func(allocStr(path));
+            if (dp.isNull()) return;
+            var entry;
+            while (!(entry = readdir_func(dp)).isNull()) {
+                // struct dirent: d_ino(8) + d_seekoff(8) + d_reclen(2) + d_namlen(2) + d_type(1) + d_name
+                var d_type = entry.add(20).readU8();
+                var d_name = entry.add(21).readUtf8String();
+                if (d_name === '.' || d_name === '..') continue;
+                var fullPath = path + '/' + d_name;
+                if (d_type === 4) { // DT_DIR
+                    walkDir(fullPath);
+                } else if (d_type === 8) { // DT_REG
+                    allFiles.push(fullPath);
+                }
+            }
+            closedir_func(dp);
+        }
+        walkDir(dirPath);
+        console.log("[frida-ios-dump]: listFiles via opendir: " + allFiles.length + " files");
+        return allFiles;
+    }
 };
