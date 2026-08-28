@@ -167,70 +167,7 @@ static void MBLogMessage(MBLogLevel level, NSString *module, NSString *format, .
 } while(0)
 
 // ============================================================================
-// 2. 全局未捕获异常与 Crash 诊断拦截 (Exception & Crash Diagnostics)
-// ============================================================================
-
-static NSUncaughtExceptionHandler *g_previous_uncaught_exception_handler = NULL;
-
-static void mb_uncaught_exception_handler(NSException *exception) {
-    @autoreleasepool {
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", @"================ CRASH: UNCAUGHT EXCEPTION ================", YES);
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", [NSString stringWithFormat:@"Name: %@", [exception name]], YES);
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", [NSString stringWithFormat:@"Reason: %@", [exception reason]], YES);
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", [NSString stringWithFormat:@"UserInfo: %@", [exception userInfo]], YES);
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", [NSString stringWithFormat:@"Call Stack Symbols:\n%@", [[exception callStackSymbols] componentsJoinedByString:@"\n"]], YES);
-        MBLogMessageInternal(MBLogLevelFatal, @"CRASH_EXCEPTION", @"============================================================", YES);
-    }
-    if (g_previous_uncaught_exception_handler) {
-        g_previous_uncaught_exception_handler(exception);
-    }
-}
-
-static void mb_signal_crash_handler(int sig, siginfo_t *info, void *context) {
-    void *callstack[128];
-    int frames = backtrace(callstack, 128);
-    char **strs = backtrace_symbols(callstack, frames);
-
-    NSMutableString *btStr = [NSMutableString string];
-    if (strs) {
-        for (int i = 0; i < frames; ++i) {
-            [btStr appendFormat:@"  [%02d] %s\n", i, strs[i]];
-        }
-        free(strs);
-    }
-
-    MBLogMessageInternal(MBLogLevelFatal, @"CRASH_SIGNAL", [NSString stringWithFormat:@"================ CRASH: POSIX SIGNAL %d ================", sig], YES);
-    MBLogMessageInternal(MBLogLevelFatal, @"CRASH_SIGNAL", [NSString stringWithFormat:@"Fault Address: %p, Signal: %d (%s)", info ? info->si_addr : NULL, sig, strsignal(sig)], YES);
-    MBLogMessageInternal(MBLogLevelFatal, @"CRASH_SIGNAL", [NSString stringWithFormat:@"Backtrace:\n%@", btStr], YES);
-    MBLogMessageInternal(MBLogLevelFatal, @"CRASH_SIGNAL", @"=========================================================", YES);
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    sigaction(sig, &sa, NULL);
-    raise(sig);
-}
-
-static void mb_setup_crash_handlers(void) {
-    g_previous_uncaught_exception_handler = NSGetUncaughtExceptionHandler();
-    NSSetUncaughtExceptionHandler(&mb_uncaught_exception_handler);
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = mb_signal_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGILL,  &sa, NULL);
-    sigaction(SIGFPE,  &sa, NULL);
-}
-
-// ============================================================================
-// 3. 网络请求异常与失败监控模块 (Network Failure & Error Monitor)
+// 2. 网络请求异常与失败监控模块 (Network Failure & Error Monitor)
 // ============================================================================
 
 static void mb_analyze_and_log_network_error(NSURLRequest *request, NSURLResponse *response, NSData *data, NSError *error, NSTimeInterval duration) {
@@ -394,40 +331,8 @@ static int my_isatty(int fd) {
     return 0;
 }
 
-typedef sig_t (*signal_ptr_t)(int sig, sig_t func);
-static signal_ptr_t orig_signal = NULL;
-static sig_t my_signal(int sig, sig_t func) {
-    if (sig == SIGTRAP || sig == SIGBUS || sig == SIGSEGV) {
-        MBLogI(@"Anti-Debug", @"拦截针对调试信号 %d 的非法注册覆写", sig);
-        return SIG_DFL;
-    }
-    return orig_signal ? orig_signal(sig, func) : SIG_DFL;
-}
-
-typedef kern_return_t (*task_set_exception_ports_ptr_t)(
-    task_t task,
-    exception_mask_t mask,
-    mach_port_t new_port,
-    exception_behavior_t behavior,
-    thread_state_flavor_t new_flavor
-);
-static task_set_exception_ports_ptr_t orig_task_set_exception_ports = NULL;
-static kern_return_t my_task_set_exception_ports(
-    task_t task,
-    exception_mask_t mask,
-    mach_port_t new_port,
-    exception_behavior_t behavior,
-    thread_state_flavor_t new_flavor
-) {
-    if (mask & (EXC_MASK_BREAKPOINT | EXC_MASK_BAD_ACCESS)) {
-        MBLogI(@"Anti-Debug", @"拦截覆盖宿主断点异常处理端口 (mask: 0x%x)", mask);
-        return KERN_SUCCESS;
-    }
-    return orig_task_set_exception_ports ? orig_task_set_exception_ports(task, mask, new_port, behavior, new_flavor) : KERN_SUCCESS;
-}
-
 // ============================================================================
-// 5. 越狱检测绕过模块 (Jailbreak Detection Bypass)
+// 4. 越狱检测绕过模块 (Jailbreak Detection Bypass)
 // ============================================================================
 
 static BOOL is_jailbreak_path(const char *path) {
@@ -783,7 +688,6 @@ static int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen
 %ctor {
     @autoreleasepool {
         mb_init_log_system();
-        mb_setup_crash_handlers();
 
         NSDictionary *infoDict = [[NSBundle mainBundle] infoDictionary];
         NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"Unknown";
@@ -803,8 +707,6 @@ static int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen
         // 注册 C API Hook
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "sysctl"), (void *)my_sysctl, (void **)&orig_sysctl);
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "isatty"), (void *)my_isatty, (void **)&orig_isatty);
-        MSHookFunction((void *)dlsym(RTLD_DEFAULT, "signal"), (void *)my_signal, (void **)&orig_signal);
-        MSHookFunction((void *)dlsym(RTLD_DEFAULT, "task_set_exception_ports"), (void *)my_task_set_exception_ports, (void **)&orig_task_set_exception_ports);
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "stat"), (void *)my_stat, (void **)&orig_stat);
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "lstat"), (void *)my_lstat, (void **)&orig_lstat);
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "access"), (void *)my_access, (void **)&orig_access);
