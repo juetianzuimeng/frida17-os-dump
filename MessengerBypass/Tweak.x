@@ -664,12 +664,105 @@ static int my_mbedtls_x509_crt_verify(
     return 0;
 }
 
+typedef OSStatus (*SecTrustEvaluateAsync_ptr_t)(SecTrustRef trust, dispatch_queue_t queue, SecTrustCallback resultHandler);
+static SecTrustEvaluateAsync_ptr_t orig_SecTrustEvaluateAsync = NULL;
+static OSStatus my_SecTrustEvaluateAsync(SecTrustRef trust, dispatch_queue_t queue, SecTrustCallback resultHandler) {
+    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"强制放行 SecTrustEvaluateAsync 异步证书校验");
+    if (resultHandler) {
+        dispatch_async(queue ?: dispatch_get_main_queue(), ^{
+            resultHandler(trust, kSecTrustResultProceed);
+        });
+    }
+    return errSecSuccess;
+}
+
+typedef OSStatus (*SecTrustEvaluateAsyncWithError_ptr_t)(SecTrustRef trust, dispatch_queue_t queue, SecTrustWithErrorCallback resultHandler);
+static SecTrustEvaluateAsyncWithError_ptr_t orig_SecTrustEvaluateAsyncWithError = NULL;
+static OSStatus my_SecTrustEvaluateAsyncWithError(SecTrustRef trust, dispatch_queue_t queue, SecTrustWithErrorCallback resultHandler) {
+    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"强制放行 SecTrustEvaluateAsyncWithError 异步证书校验");
+    if (resultHandler) {
+        dispatch_async(queue ?: dispatch_get_main_queue(), ^{
+            resultHandler(trust, true, NULL);
+        });
+    }
+    return errSecSuccess;
+}
+
+typedef int (*X509_verify_cert_ptr_t)(void *ctx);
+static X509_verify_cert_ptr_t orig_X509_verify_cert = NULL;
+static int my_X509_verify_cert(void *ctx) {
+    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"强制通过 X509_verify_cert 证书校验");
+    return 1;
+}
+
+typedef void (*SSL_CTX_set_verify_ptr_t)(void *ctx, int mode, int (*verify_callback)(int, void *));
+static SSL_CTX_set_verify_ptr_t orig_SSL_CTX_set_verify = NULL;
+static void my_SSL_CTX_set_verify(void *ctx, int mode, int (*verify_callback)(int, void *)) {
+    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"重置 SSL_CTX_set_verify mode 为 SSL_VERIFY_NONE (0)");
+    if (orig_SSL_CTX_set_verify) {
+        orig_SSL_CTX_set_verify(ctx, 0, NULL);
+    }
+}
+
+typedef long (*SSL_get_verify_result_ptr_t)(const void *ssl);
+static SSL_get_verify_result_ptr_t orig_SSL_get_verify_result = NULL;
+static long my_SSL_get_verify_result(const void *ssl) {
+    return 0; // X509_V_OK
+}
+
+typedef BOOL (*MNSQUICSettingsGetTrustSandboxCertificates_ptr_t)(void *settings);
+static MNSQUICSettingsGetTrustSandboxCertificates_ptr_t orig_MNSQUICSettingsGetTrustSandboxCertificates = NULL;
+static BOOL my_MNSQUICSettingsGetTrustSandboxCertificates(void *settings) {
+    return YES;
+}
+
+typedef void* (*MBIGetCertificatePinning_ptr_t)(void);
+static MBIGetCertificatePinning_ptr_t orig_MBIGetCertificatePinning = NULL;
+static void* my_MBIGetCertificatePinning(void) {
+    return NULL;
+}
+
 static void try_hook_ssl_symbols(void) {
     if (!orig_mbedtls_x509_crt_verify) {
-        void *mbedtls_fn = dlsym(RTLD_DEFAULT, "mbedtls_x509_crt_verify");
-        if (mbedtls_fn) {
-            MSHookFunction(mbedtls_fn, (void *)my_mbedtls_x509_crt_verify, (void **)&orig_mbedtls_x509_crt_verify);
-            MBLogI(@"SSL-Pinning", @"成功挂钩 mbedtls_x509_crt_verify: %p", mbedtls_fn);
+        void *fn = dlsym(RTLD_DEFAULT, "mbedtls_x509_crt_verify");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_mbedtls_x509_crt_verify, (void **)&orig_mbedtls_x509_crt_verify);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 mbedtls_x509_crt_verify: %p", fn);
+        }
+    }
+    if (!orig_X509_verify_cert) {
+        void *fn = dlsym(RTLD_DEFAULT, "X509_verify_cert");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_X509_verify_cert, (void **)&orig_X509_verify_cert);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 X509_verify_cert: %p", fn);
+        }
+    }
+    if (!orig_SSL_CTX_set_verify) {
+        void *fn = dlsym(RTLD_DEFAULT, "SSL_CTX_set_verify");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_SSL_CTX_set_verify, (void **)&orig_SSL_CTX_set_verify);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 SSL_CTX_set_verify: %p", fn);
+        }
+    }
+    if (!orig_SSL_get_verify_result) {
+        void *fn = dlsym(RTLD_DEFAULT, "SSL_get_verify_result");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_SSL_get_verify_result, (void **)&orig_SSL_get_verify_result);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 SSL_get_verify_result: %p", fn);
+        }
+    }
+    if (!orig_MNSQUICSettingsGetTrustSandboxCertificates) {
+        void *fn = dlsym(RTLD_DEFAULT, "MNSQUICSettingsGetTrustSandboxCertificates");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_MNSQUICSettingsGetTrustSandboxCertificates, (void **)&orig_MNSQUICSettingsGetTrustSandboxCertificates);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 MNSQUICSettingsGetTrustSandboxCertificates: %p", fn);
+        }
+    }
+    if (!orig_MBIGetCertificatePinning) {
+        void *fn = dlsym(RTLD_DEFAULT, "MBIGetCertificatePinning");
+        if (fn) {
+            MSHookFunction(fn, (void *)my_MBIGetCertificatePinning, (void **)&orig_MBIGetCertificatePinning);
+            MBLogI(@"SSL-Pinning", @"成功挂钩 MBIGetCertificatePinning: %p", fn);
         }
     }
 }
@@ -737,6 +830,10 @@ static int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen
         if (secTrustErr) MSHookFunction(secTrustErr, (void *)my_SecTrustEvaluateWithError, (void **)&orig_SecTrustEvaluateWithError);
         void *secTrust = dlsym(RTLD_DEFAULT, "SecTrustEvaluate");
         if (secTrust) MSHookFunction(secTrust, (void *)my_SecTrustEvaluate, (void **)&orig_SecTrustEvaluate);
+        void *secTrustAsync = dlsym(RTLD_DEFAULT, "SecTrustEvaluateAsync");
+        if (secTrustAsync) MSHookFunction(secTrustAsync, (void *)my_SecTrustEvaluateAsync, (void **)&orig_SecTrustEvaluateAsync);
+        void *secTrustAsyncErr = dlsym(RTLD_DEFAULT, "SecTrustEvaluateAsyncWithError");
+        if (secTrustAsyncErr) MSHookFunction(secTrustAsyncErr, (void *)my_SecTrustEvaluateAsyncWithError, (void **)&orig_SecTrustEvaluateAsyncWithError);
         
         MSHookFunction((void *)dlsym(RTLD_DEFAULT, "connect"), (void *)my_connect, (void **)&orig_connect);
 
