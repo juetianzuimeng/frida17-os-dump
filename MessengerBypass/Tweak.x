@@ -716,18 +716,6 @@ static BOOL my_MNSQUICSettingsGetTrustSandboxCertificates(void *settings) {
     return YES;
 }
 
-typedef void* (*MBIGetCertificatePinning_ptr_t)(void);
-static MBIGetCertificatePinning_ptr_t orig_MBIGetCertificatePinning = NULL;
-static void* my_MBIGetCertificatePinning(void) {
-    return NULL;
-}
-
-typedef void* (*MBIGetCertificatePinningFromBundles_ptr_t)(void *bundles);
-static MBIGetCertificatePinningFromBundles_ptr_t orig_MBIGetCertificatePinningFromBundles = NULL;
-static void* my_MBIGetCertificatePinningFromBundles(void *bundles) {
-    return NULL;
-}
-
 static void try_hook_ssl_symbols(void) {
     if (!orig_mbedtls_x509_crt_verify) {
         void *fn = dlsym(RTLD_DEFAULT, "mbedtls_x509_crt_verify");
@@ -762,20 +750,6 @@ static void try_hook_ssl_symbols(void) {
         if (fn) {
             MSHookFunction(fn, (void *)my_MNSQUICSettingsGetTrustSandboxCertificates, (void **)&orig_MNSQUICSettingsGetTrustSandboxCertificates);
             MBLogI(@"SSL-Pinning", @"成功挂钩 MNSQUICSettingsGetTrustSandboxCertificates: %p", fn);
-        }
-    }
-    if (!orig_MBIGetCertificatePinning) {
-        void *fn = dlsym(RTLD_DEFAULT, "MBIGetCertificatePinning");
-        if (fn) {
-            MSHookFunction(fn, (void *)my_MBIGetCertificatePinning, (void **)&orig_MBIGetCertificatePinning);
-            MBLogI(@"SSL-Pinning", @"成功挂钩 MBIGetCertificatePinning: %p", fn);
-        }
-    }
-    if (!orig_MBIGetCertificatePinningFromBundles) {
-        void *fn = dlsym(RTLD_DEFAULT, "MBIGetCertificatePinningFromBundles");
-        if (fn) {
-            MSHookFunction(fn, (void *)my_MBIGetCertificatePinningFromBundles, (void **)&orig_MBIGetCertificatePinningFromBundles);
-            MBLogI(@"SSL-Pinning", @"成功挂钩 MBIGetCertificatePinningFromBundles: %p", fn);
         }
     }
 }
