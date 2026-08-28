@@ -32,7 +32,7 @@ temp_*/
 # Theos build artifacts & test tweaks
 .theos/
 packages/
-*Bypass/
+*.deb
 
 # Logs and sensitive info
 手机连接信息.txt

@@ -1,0 +1,9 @@
+Package: com.securityresearcher.messengerbypass
+Name: MessengerBypass
+Depends: ellekit | mobilesubstrate
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Automated security protection bypass tweak for Messenger
+Maintainer: SecurityResearcher
+Author: SecurityResearcher
+Section: Tweaks
