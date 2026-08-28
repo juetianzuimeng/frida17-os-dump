@@ -473,11 +473,31 @@ static pid_t my_fork(void) {
 }
 
 - (BOOL)createFileAtPath:(NSString *)path contents:(NSData *)data attributes:(NSDictionary *)attr {
-    if (path && ([path containsString:@"/private/"] || [path containsString:@"/var/mobile/"])) {
-        MBLogI(@"Jailbreak", @"拦截沙盒逃逸写测试: %@", path);
-        return NO;
+    if (path) {
+        // 如果属于应用自身的合法沙盒路径（tmp/Documents/Library/Containers），直接放行
+        if ([path containsString:@"/Containers/Data/Application/"] ||
+            [path containsString:@"/Containers/Bundle/Application/"] ||
+            [path containsString:@"/Containers/Shared/AppGroup/"] ||
+            [path containsString:@"/Application/"] ||
+            [path containsString:@"/tmp/"] ||
+            [path containsString:@"/Documents/"] ||
+            [path containsString:@"/Library/"]) {
+            return %orig(path, data, attr);
+        }
+        // 仅拦截向沙盒外部公共根目录或系统敏感目录的逃逸写探测
+        if ([path isEqualToString:@"/private/jailbreak.txt"] ||
+            [path isEqualToString:@"/private/test.txt"] ||
+            [path isEqualToString:@"/private/var/tmp/test.txt"] ||
+            [path isEqualToString:@"/var/mobile/test.txt"] ||
+            [path isEqualToString:@"/var/mobile/jailbreak.txt"] ||
+            [path hasPrefix:@"/private/var/root/"] ||
+            [path hasPrefix:@"/private/etc/"] ||
+            [path hasPrefix:@"/private/var/lib/"]) {
+            MBLogI(@"Jailbreak", @"拦截沙盒逃逸写测试: %@", path);
+            return NO;
+        }
     }
-    return %orig;
+    return %orig(path, data, attr);
 }
 %end
 
