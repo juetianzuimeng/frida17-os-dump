@@ -24,7 +24,7 @@ TWEAK_NAME = MessengerBypass
 MessengerBypass_FILES = Tweak.x
 MessengerBypass_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-unused-function
 MessengerBypass_FRAMEWORKS = Foundation UIKit Security
-MessengerBypass_LIBRARIES = substrate
+MessengerBypass_LIBRARIES = substrate sqlite3
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
