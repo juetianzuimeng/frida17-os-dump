@@ -21,12 +21,18 @@
 #import <unistd.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
 #import <Security/Security.h>
 #import <signal.h>
 #import <execinfo.h>
 #import <os/lock.h>
+#import <string.h>
+#import <stdio.h>
+#import <stdint.h>
 #import <substrate.h>
+#import <objc/runtime.h>
 
 // ============================================================================
 // 1. 统一高性能日志引擎 (High-Performance Async Logging Engine)
@@ -638,8 +644,21 @@ static pid_t my_fork(void) {
 
 typedef OSStatus (*SecTrustEvaluateWithError_ptr_t)(SecTrustRef trust, CFErrorRef *error);
 static SecTrustEvaluateWithError_ptr_t orig_SecTrustEvaluateWithError = NULL;
+static const uint8_t *g_lse_base = NULL;
+static uint64_t g_lse_span = 0;
+static int g_sectrust_lr_n = 0;
 static OSStatus my_SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
-    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"强制放行 SecTrustEvaluateWithError 证书校验");
+    void *lr = __builtin_return_address(0);
+    const char *src = "other";
+    if (g_lse_base && (const uint8_t *)lr >= g_lse_base && (const uint8_t *)lr < g_lse_base + g_lse_span)
+        src = "LSE";
+    if (g_sectrust_lr_n < 16) {
+        g_sectrust_lr_n++;
+        MBLogI(@"SSL-Pinning", @"强制放行 SecTrustEvaluateWithError src=%s lr=%p n=%d", src, lr, g_sectrust_lr_n);
+    } else {
+        MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning",
+                         @"强制放行 SecTrustEvaluateWithError src=%s lr=%p", src, lr);
+    }
     if (error) {
         *error = NULL;
     }
@@ -664,6 +683,23 @@ static OSStatus my_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *resul
 - (void)setSSLPinningMode:(NSUInteger)mode {
     MBLogI(@"SSL-Pinning", @"重置 AFSecurityPolicy SSLPinningMode 为 None");
     %orig(0);
+}
+%end
+
+// MNS Apple 证书校验辅助类 (LSE). 只观测: 若握手期进这里, 说明 Fizz 走 MNSCertificateVerifierApple,
+// 在 SecTrust 之后还有 PEM/公钥签名校验 (现有 X509/mbedtls hook 覆盖不到).
+%hook MNSCertificateVerifierAppleCrlUtil
++ (id)publicKeyFromPEM:(id)pem {
+    MBLogI(@"SSL-Pinning", @"🔎 [AppleCrlUtil] publicKeyFromPEM: pemLen=%lu", (unsigned long)([pem respondsToSelector:@selector(length)] ? [pem length] : 0));
+    return %orig;
+}
++ (BOOL)verifySignature:(id)data withSignature:(id)sig publicKey:(id)key {
+    BOOL ok = %orig;
+    MBLogI(@"SSL-Pinning", @"🔎 [AppleCrlUtil] verifySignature dataLen=%lu sigLen=%lu key=%p -> %d",
+           (unsigned long)([data respondsToSelector:@selector(length)] ? [data length] : 0),
+           (unsigned long)([sig respondsToSelector:@selector(length)] ? [sig length] : 0),
+           key, (int)ok);
+    return ok;
 }
 %end
 
@@ -869,6 +905,19 @@ static int g_lse_w_total = 0;
 // protos = 长度前缀列表, 例如 02 68 32 = "h2"
 typedef int (*ssl_set_alpn_t)(void *ssl, const uint8_t *protos, unsigned len);
 static ssl_set_alpn_t orig_LSE_SSL_set_alpn = NULL;
+typedef int (*ssl_get0_alpn_t)(void *ssl, const unsigned char **data, unsigned int *len);
+static ssl_get0_alpn_t orig_LSE_SSL_get0_alpn = NULL;
+static int my_LSE_SSL_get0_alpn(void *ssl, const unsigned char **data, unsigned int *len) {
+    int r = orig_LSE_SSL_get0_alpn ? orig_LSE_SSL_get0_alpn(ssl, data, len) : 0;
+    @try {
+        if (data && *data && len && *len > 0 && *len < 64) {
+            NSString *p = [[NSString alloc] initWithBytes:*data length:*len encoding:NSUTF8StringEncoding];
+            MBLogRateLimited(1.0, MBLogLevelInfo, @"MNS_ALPN",
+                             @"🔎 SSL_get0_alpn_selected ssl=%p => '%@'", ssl, p ?: @"?");
+        }
+    } @catch (__unused NSException *e) {}
+    return r;
+}
 static int my_LSE_SSL_set_alpn(void *ssl, const uint8_t *protos, unsigned len) {
     @try {
         if (protos && len > 0 && len < 256) {
@@ -929,8 +978,114 @@ static int my_LSE_SSL_read(void *ssl, const void *buf, int num) {
     return res;
 }
 
+// NSS keylog: 解开 TLS (H2/POST /lightspeed), 不解业务 E2EE。VPN 保持透传, 用这份密钥离线解 pcap。
+static NSString *mb_keylog_path(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *dir = paths.firstObject ?: NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:@"fizz_sslkeylog.txt"];
+}
+static void mb_keylog_append(const char *line) {
+    if (!line || !line[0]) return;
+    NSString *path = mb_keylog_path();
+    FILE *fp = fopen(path.UTF8String, "a");
+    if (fp) {
+        fputs(line, fp);
+        if (line[strlen(line) - 1] != '\n') fputc('\n', fp);
+        fclose(fp);
+    }
+    MBLogRateLimited(0.2, MBLogLevelInfo, @"KEYLOG", @"%s", line);
+}
+
+typedef void (*ssl_keylog_cb_t)(void *ssl, const char *line);
+static void my_ssl_keylog_line(void *ssl, const char *line) {
+    mb_keylog_append(line);
+}
+
+typedef void *(*ssl_ctx_new_t)(void *method);
+static ssl_ctx_new_t orig_LSE_SSL_CTX_new = NULL;
+typedef void (*ssl_ctx_set_keylog_t)(void *ctx, ssl_keylog_cb_t cb);
+static ssl_ctx_set_keylog_t orig_LSE_SSL_CTX_set_keylog = NULL;
+static void *my_LSE_SSL_CTX_new(void *method) {
+    void *ctx = orig_LSE_SSL_CTX_new(method);
+    if (ctx && orig_LSE_SSL_CTX_set_keylog) {
+        orig_LSE_SSL_CTX_set_keylog(ctx, my_ssl_keylog_line);
+        MBLogI(@"KEYLOG", @"SSL_CTX_new ctx=%p → 已装 keylog callback", ctx);
+    }
+    return ctx;
+}
+static void my_LSE_SSL_CTX_set_keylog(void *ctx, ssl_keylog_cb_t cb) {
+    orig_LSE_SSL_CTX_set_keylog(ctx, my_ssl_keylog_line);
+}
+
+typedef void (*mns_set_keylog_url_t)(void *settings, CFURLRef url);
+static mns_set_keylog_url_t p_setKeylogFileURL = NULL;
+static CFURLRef g_keylog_cfurl = NULL;
+static bool mb_looks_heap_ptr(void *p) {
+    uintptr_t v = (uintptr_t)p;
+    return v > 0x100000000ULL && v < 0x300000000ULL;
+}
+static void mb_try_set_fizz_keylog(void *settings, const char *via) {
+    if (!settings || !p_setKeylogFileURL) return;
+    if (!mb_looks_heap_ptr(settings)) {
+        MBLogW(@"KEYLOG", @"setKeylogFileURL skip via=%s settings=%p (不像堆指针)", via, settings);
+        return;
+    }
+    if (!g_keylog_cfurl) {
+        NSURL *u = [NSURL fileURLWithPath:mb_keylog_path()];
+        if (u) g_keylog_cfurl = (CFURLRef)CFBridgingRetain(u);
+    }
+    if (!g_keylog_cfurl) return;
+    p_setKeylogFileURL(settings, g_keylog_cfurl);
+    MBLogI(@"KEYLOG", @"setKeylogFileURL via=%s settings=%p → %@", via, settings, mb_keylog_path());
+}
+
+static bool mb_safe_read(const void *src, void *dst, size_t n) {
+    if (!src || !dst || n == 0) return false;
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)src, (vm_size_t)n,
+                             (vm_address_t)dst, &got) == KERN_SUCCESS && got == n;
+}
+// SecureTCPSettings: +0x98 u32 TLSBackend (0=mbedtls ctx @0x17d650, 1=Fizz ctx @0xa432d0)
+//                   +0x9f u8  useMbedtlsCertificateVerifier
+// getUseMbedtls 是 ldrb+ret, 调用方内联, hook getter 永远不进。只能读字段。
+static void mb_try_dump_stcp_settings(const char *via, void *p) {
+    if (!p) return;
+    uint32_t backend = 0xFFFFFFFFu;
+    uint8_t useMb = 0xFF;
+    if (!mb_safe_read((const uint8_t *)p + 0x98, &backend, 4)) return;
+    if (backend > 3) return;
+    (void)mb_safe_read((const uint8_t *)p + 0x9f, &useMb, 1);
+    MBLogI(@"SSL-Pinning", @"🔎 [Settings] via=%s obj=%p TLSBackend=%u (%s) useMbedtlsVerifier=%u",
+           via, p, backend, backend == 0 ? "mbedtls" : (backend == 1 ? "fizz" : "?"), useMb);
+}
+static void mb_scan_stcp_settings(void *const *args, int n) {
+    for (int i = 0; i < n; i++) {
+        void *p = args[i];
+        if (!p) continue;
+        char tag[16];
+        snprintf(tag, sizeof(tag), "x%d", i);
+        mb_try_dump_stcp_settings(tag, p);
+        void *deref = NULL;
+        if (mb_safe_read(p, &deref, sizeof(deref)) && deref) {
+            snprintf(tag, sizeof(tag), "x%d.deref", i);
+            mb_try_dump_stcp_settings(tag, deref);
+        }
+    }
+}
+
+typedef void *(*mns_stcp_create_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static mns_stcp_create_t orig_MNSSecureTCPConnectionCreate = NULL;
+static void *my_MNSSecureTCPConnectionCreate(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    // v43 对 x5 调 setKeylogFileURL → ABI 不对, MnsEvThread SIGSEGV。只记参数, 不写 settings。
+    MBLogI(@"KEYLOG", @"Create ev=%p/%p cb=%p cache=%p/%p settings=%p/%p ctx=%p (不调 setter)", a0, a1, a2, a3, a4, a5, a6, a7);
+    void *args[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
+    mb_scan_stcp_settings(args, 8);
+    return orig_MNSSecureTCPConnectionCreate(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
 static void hook_lse_boringssl(void) {
-    if (orig_LSE_SSL_write && orig_LSE_SSL_read && orig_LSE_SSL_set_alpn) return;
+    if (orig_LSE_SSL_write && orig_LSE_SSL_read && orig_LSE_SSL_set_alpn && orig_LSE_SSL_get0_alpn
+        && orig_LSE_SSL_CTX_new && orig_LSE_SSL_CTX_set_keylog) return;
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -954,6 +1109,25 @@ static void hook_lse_boringssl(void) {
                      MBLogI(@"MQTT", @"✅ 定向挂钩 LightSpeedEngine SSL_set_alpn_protos (ALPN 列表): %p", a); }
             else MBLogW(@"MQTT", @"⚠️ LightSpeedEngine 无 SSL_set_alpn_protos");
         }
+        if (!orig_LSE_SSL_get0_alpn) {
+            void *g = dlsym(h, "SSL_get0_alpn_selected");
+            if (g) { MSHookFunction(g, (void *)my_LSE_SSL_get0_alpn, (void **)&orig_LSE_SSL_get0_alpn);
+                     MBLogI(@"MQTT", @"✅ 定向挂钩 LightSpeedEngine SSL_get0_alpn_selected (协商结果): %p", g); }
+        }
+        if (!orig_LSE_SSL_CTX_set_keylog) {
+            void *k = dlsym(h, "SSL_CTX_set_keylog_callback");
+            if (k) {
+                MSHookFunction(k, (void *)my_LSE_SSL_CTX_set_keylog, (void **)&orig_LSE_SSL_CTX_set_keylog);
+                MBLogI(@"KEYLOG", @"✅ 挂钩 LSE SSL_CTX_set_keylog_callback: %p", k);
+            }
+        }
+        if (!orig_LSE_SSL_CTX_new) {
+            void *n = dlsym(h, "SSL_CTX_new");
+            if (n) {
+                MSHookFunction(n, (void *)my_LSE_SSL_CTX_new, (void **)&orig_LSE_SSL_CTX_new);
+                MBLogI(@"KEYLOG", @"✅ 挂钩 LSE SSL_CTX_new (每个 ctx 装 keylog): %p", n);
+            }
+        }
         return;
     }
 }
@@ -969,6 +1143,21 @@ static X509_verify_cert_ptr_t orig_LSE_X509_verify_cert = NULL;
 static int my_LSE_X509_verify_cert(void *ctx) {
     MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning", @"✅ [LSE] 强制通过 X509_verify_cert (MNS/Fizz 链校验)");
     return 1;
+}
+typedef int (*X509_STORE_CTX_init_t)(void *ctx, void *store, void *x509, void *chain);
+static X509_STORE_CTX_init_t orig_LSE_X509_STORE_CTX_init = NULL;
+static int my_LSE_X509_STORE_CTX_init(void *ctx, void *store, void *x509, void *chain) {
+    MBLogRateLimited(1.0, MBLogLevelInfo, @"SSL-Pinning",
+                     @"🔎 [LSE] X509_STORE_CTX_init ctx=%p store=%p x509=%p chain=%p (Fizz-OpenSSL 链校验入口)",
+                     ctx, store, x509, chain);
+    return orig_LSE_X509_STORE_CTX_init ? orig_LSE_X509_STORE_CTX_init(ctx, store, x509, chain) : 0;
+}
+typedef void (*X509_STORE_CTX_set_verify_cb_t)(void *ctx, void *cb);
+static X509_STORE_CTX_set_verify_cb_t orig_LSE_X509_STORE_CTX_set_verify_cb = NULL;
+static void my_LSE_X509_STORE_CTX_set_verify_cb(void *ctx, void *cb) {
+    MBLogRateLimited(2.0, MBLogLevelInfo, @"SSL-Pinning",
+                     @"🔎 [LSE] X509_STORE_CTX_set_verify_cb ctx=%p cb=%p", ctx, cb);
+    if (orig_LSE_X509_STORE_CTX_set_verify_cb) orig_LSE_X509_STORE_CTX_set_verify_cb(ctx, cb);
 }
 static SSL_get_verify_result_ptr_t orig_LSE_SSL_get_verify_result = NULL;
 static long my_LSE_SSL_get_verify_result(const void *ssl) {
@@ -989,6 +1178,33 @@ static bool my_getEnablePoP(void *self) {
     MBLogRateLimited(5.0, MBLogLevelInfo, @"SSL-Pinning",
                      @"🚫 [LSE] HTTPSettings::getEnableCertificateVerificationWithProofOfPossession orig=%d -> 强制 false (关 PoP pinning)", o);
     return false; // 关闭 Meta 持有证明证书校验, 让 MNS 退回可被 MITM 的标准校验
+}
+
+// Fizz OpenSSL 证书路径 (仅观测): create / makePeerCert / ecVerify.
+//   若 gateway MITM 期间这些命中, 拒绝点在 Fizz 证书/EC 签名, 不在 Apple pin 函数.
+typedef uint64_t (*fizz8_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static fizz8_t orig_fizz_ossl_create = NULL;
+static fizz8_t orig_fizz_make_peer = NULL;
+static fizz8_t orig_fizz_ec_verify = NULL;
+static uint64_t my_fizz_ossl_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                   uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    MBLogI(@"SSL-Pinning", @"🔎 [Fizz] OpenSSLCertificateVerifier::create out=%p err=%p ctx=%llu store=%p",
+           (void *)a0, (void *)a1, (unsigned long long)a2, (void *)a3);
+    return orig_fizz_ossl_create ? orig_fizz_ossl_create(a0, a1, a2, a3, a4, a5, a6, a7) : 0;
+}
+static uint64_t my_fizz_make_peer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    MBLogRateLimited(1.0, MBLogLevelInfo, @"SSL-Pinning",
+                     @"🔎 [Fizz] CertUtils::makePeerCert out=%p err=%p x509=%p",
+                     (void *)a0, (void *)a1, (void *)a2);
+    return orig_fizz_make_peer ? orig_fizz_make_peer(a0, a1, a2, a3, a4, a5, a6, a7) : 0;
+}
+static uint64_t my_fizz_ec_verify(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
+    MBLogI(@"SSL-Pinning", @"🔎 [Fizz] ecVerify err=%p sig=%p slen=%llu data=%p dlen=%llu pkey=%p nid=%llu",
+           (void *)a0, (void *)a1, (unsigned long long)a2, (void *)a3,
+           (unsigned long long)a4, (void *)a5, (unsigned long long)a6);
+    return orig_fizz_ec_verify ? orig_fizz_ec_verify(a0, a1, a2, a3, a4, a5, a6, a7) : 0;
 }
 
 static void hook_lse_certpin(void) {
@@ -1013,9 +1229,183 @@ static void hook_lse_certpin(void) {
         if (p) { MSHookFunction(p, (void *)my_getEnablePoP, (void **)&orig_getEnablePoP);
                  MBLogI(@"SSL-Pinning", @"✅ 定向挂钩 LSE getEnableCertVerifWithPoP -> false (关 MNS PoP pinning): %p", p); }
         else MBLogW(@"SSL-Pinning", @"⚠️ LSE 无 getEnableCertVerifWithPoP 导出");
+        void *xi = dlsym(h, "X509_STORE_CTX_init");
+        if (xi && !orig_LSE_X509_STORE_CTX_init) {
+            MSHookFunction(xi, (void *)my_LSE_X509_STORE_CTX_init, (void **)&orig_LSE_X509_STORE_CTX_init);
+            MBLogI(@"SSL-Pinning", @"✅ 定向挂钩 LSE X509_STORE_CTX_init (观测 Fizz-OpenSSL 是否走链校验): %p", xi);
+        }
+        void *xcb = dlsym(h, "X509_STORE_CTX_set_verify_cb");
+        if (xcb && !orig_LSE_X509_STORE_CTX_set_verify_cb) {
+            MSHookFunction(xcb, (void *)my_LSE_X509_STORE_CTX_set_verify_cb, (void **)&orig_LSE_X509_STORE_CTX_set_verify_cb);
+            MBLogI(@"SSL-Pinning", @"✅ 定向挂钩 LSE X509_STORE_CTX_set_verify_cb: %p", xcb);
+        }
+        g_lse_base = (const uint8_t *)_dyld_get_image_header(i);
+        g_lse_span = 0x2000000;
+        void *fc = dlsym(h, "_ZN4fizz7openssl26OpenSSLCertificateVerifier6createERNSt3__110unique_ptrIS1_NS2_14default_deleteIS1_EEEERNS_5ErrorENS_19VerificationContextEONS3_I13x509_store_stN5folly23static_function_deleterISB_XadL_Z15X509_STORE_freeEEEEEE");
+        if (fc && !orig_fizz_ossl_create) {
+            MSHookFunction(fc, (void *)my_fizz_ossl_create, (void **)&orig_fizz_ossl_create);
+            MBLogI(@"SSL-Pinning", @"✅ 挂钩 Fizz OpenSSLCertificateVerifier::create (仅观测): %p", fc);
+        } else MBLogW(@"SSL-Pinning", @"⚠️ LSE 无 OpenSSLCertificateVerifier::create");
+        void *fp = dlsym(h, "_ZN4fizz7openssl9CertUtils12makePeerCertERNSt3__110unique_ptrINS_8PeerCertENS2_14default_deleteIS4_EEEERNS_5ErrorENS3_I7x509_stN5folly23static_function_deleterISB_XadL_Z9X509_freeEEEEEE");
+        if (fp && !orig_fizz_make_peer) {
+            MSHookFunction(fp, (void *)my_fizz_make_peer, (void **)&orig_fizz_make_peer);
+            MBLogI(@"SSL-Pinning", @"✅ 挂钩 Fizz CertUtils::makePeerCert (仅观测): %p", fp);
+        } else MBLogW(@"SSL-Pinning", @"⚠️ LSE 无 CertUtils::makePeerCert");
+        void *fe = dlsym(h, "_ZN4fizz7openssl6detail8ecVerifyERNS_5ErrorEN5folly5RangeIPKhEES8_RKNSt3__110unique_ptrI11evp_pkey_stNS4_23static_function_deleterISB_XadL_Z13EVP_PKEY_freeEEEEEEi");
+        if (fe && !orig_fizz_ec_verify) {
+            MSHookFunction(fe, (void *)my_fizz_ec_verify, (void **)&orig_fizz_ec_verify);
+            MBLogI(@"SSL-Pinning", @"✅ 挂钩 Fizz ecVerify (仅观测): %p", fe);
+        } else MBLogW(@"SSL-Pinning", @"⚠️ LSE 无 fizz::openssl::detail::ecVerify");
         return;
     }
     MBLogW(@"SSL-Pinning", @"⚠️ LightSpeedEngine 未加载, MNS certpin hook 未安装");
+}
+
+// MNS Apple 证书校验 + SPKI pinning (无导出符号).
+//   真机 OLLVM 把函数拆开: 钩 0x35209c 头改返回值拦不住中段.
+//   SecTrust 已放行; 剩余失败在 mid+0x124 的 cbnz 进入 SPKI 循环 (未滑动 0x352244).
+//   成功收尾是 mid+0x2DC 的 `mov x19, #0` (未滑动 0x3523e0).
+//   定位靠字符串 xref + 中段签名, 再相对 mid 打补丁, 禁止写死 VA.
+static int g_apple_pin_scan_once = 0;
+static int64_t mb_adrp_imm(uint32_t insn, uint64_t pc) {
+    int64_t immhi = (insn >> 5) & 0x7FFFF;
+    int64_t immlo = (insn >> 29) & 3;
+    int64_t imm = (immhi << 2) | immlo;
+    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
+    return (int64_t)(pc & ~0xFFFULL) + (imm << 12);
+}
+static void *mb_find_apple_pin_verify(const uint8_t *base) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)base;
+    if (mh->magic != MH_MAGIC_64) return NULL;
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    uint64_t text_addr = 0, text_sz = 0, cstr_addr = 0, cstr_sz = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sec = (const struct section_64 *)(seg + 1);
+            for (uint32_t j = 0; j < seg->nsects; j++, sec++) {
+                if (strncmp(sec->sectname, "__text", 16) == 0 && strncmp(sec->segname, "__TEXT", 16) == 0) {
+                    text_addr = sec->addr;
+                    text_sz = sec->size;
+                } else if (strncmp(sec->sectname, "__cstring", 16) == 0) {
+                    cstr_addr = sec->addr;
+                    cstr_sz = sec->size;
+                }
+            }
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    if (!text_sz || !cstr_sz) return NULL;
+    const uint8_t *cstr = base + cstr_addr;
+    const char *needle = "Pinning validation failed.";
+    size_t nlen = strlen(needle);
+    const uint8_t *found = NULL;
+    for (uint64_t off = 0; off + nlen <= cstr_sz; off++) {
+        if (memcmp(cstr + off, needle, nlen) == 0) { found = cstr + off; break; }
+    }
+    if (!found) return NULL;
+    uint64_t str_rt = (uint64_t)found;
+    const uint8_t *text = base + text_addr;
+    uint64_t xref = 0;
+    for (uint64_t off = 0; off + 8 <= text_sz; off += 4) {
+        uint32_t insn = *(const uint32_t *)(text + off);
+        if ((insn & 0x9F000000u) != 0x90000000u) continue; // ADRP
+        unsigned rd = insn & 31u;
+        uint64_t pc = (uint64_t)(text + off);
+        uint64_t page = (uint64_t)mb_adrp_imm(insn, pc);
+        uint32_t add = *(const uint32_t *)(text + off + 4);
+        if ((add & 0xFFC00000u) != 0x91000000u) continue; // ADD imm
+        if (((add >> 5) & 31u) != rd) continue;
+        unsigned sh = (add >> 22) & 3u;
+        uint64_t imm12 = (add >> 10) & 0xFFFu;
+        if (sh == 1) imm12 <<= 12;
+        else if (sh != 0) continue;
+        if (page + imm12 == str_rt) { xref = pc; break; }
+    }
+    if (!xref) {
+        MBLogW(@"SSL-Pinning", @"⚠️ ApplePin 扫到字符串 %p 但无 ADRP/ADD 引用", found);
+        return NULL;
+    }
+    uint64_t text_lo = (uint64_t)text;
+    uint64_t nearest = 0;
+    int nearest_frame = -1;
+    for (uint64_t a = xref; a > xref - 0x2000 && a >= text_lo + 8; a -= 4) {
+        uint32_t insn = *(const uint32_t *)a;
+        if (insn == 0x6db923e9u) { nearest = a; nearest_frame = 0x70; break; }
+        if (insn == 0xD503237Fu) { nearest = a; nearest_frame = 0x70; break; } // PACIBSP
+        if ((insn & 0xFFC003FFu) == 0xA98003FDu) {
+            int imm7 = (int)((insn >> 15) & 0x7F);
+            if (imm7 & 0x40) imm7 -= 0x80;
+            nearest = a;
+            nearest_frame = -imm7 * 8;
+            break;
+        }
+    }
+    // 真机 OLLVM: 函数头是小栈帧 stp x29,x30, 不能按 frame>=0x40 过滤.
+    // 用 dump/真机都有的中段签名确认这是 pin-verify:
+    //   stp x29,x30,[sp,#0x60]; add x29,sp,#0x60; mov x9,#0x1030
+    uint64_t mid = 0;
+    uint64_t scan_lo = xref > 0x400 ? xref - 0x400 : text_lo;
+    uint64_t scan_hi = xref + 0x100;
+    if (scan_hi > text_lo + text_sz - 12) scan_hi = text_lo + text_sz - 12;
+    for (uint64_t a = scan_lo; a + 12 <= scan_hi; a += 4) {
+        uint32_t a0 = *(const uint32_t *)a;
+        uint32_t a1 = *(const uint32_t *)(a + 4);
+        uint32_t a2 = *(const uint32_t *)(a + 8);
+        if (a0 == 0xA9067BFDu && a1 == 0x910183FDu && a2 == 0xD2820609u) { mid = a; break; }
+    }
+    uint32_t xinsn = xref ? *(const uint32_t *)xref : 0;
+    MBLogI(@"SSL-Pinning", @"🔎 ApplePin scan xref=%p insn=0x%08x mid=%p nearest=%p frame=%d",
+           (void *)xref, xinsn, (void *)mid, (void *)nearest, nearest_frame);
+    return mid ? (void *)mid : NULL;
+}
+static int mb_patch_insn(void *addr, uint32_t expect, uint32_t repl) {
+    uint32_t cur = *(const uint32_t *)addr;
+    if (cur != expect) {
+        MBLogW(@"SSL-Pinning", @"⚠️ 补丁点 %p insn=0x%08x 不是预期 0x%08x, 跳过", addr, cur, expect);
+        return -1;
+    }
+    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)PAGE_SIZE - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        MBLogW(@"SSL-Pinning", @"⚠️ vm_protect RW %p 失败 kr=%d", addr, (int)kr);
+        return -1;
+    }
+    *(uint32_t *)addr = repl;
+    vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate(addr, 4);
+    MBLogI(@"SSL-Pinning", @"✅ 写入 %p 0x%08x -> 0x%08x", addr, expect, repl);
+    return 0;
+}
+static void hook_lse_apple_pin_verify(void) {
+    if (g_apple_pin_scan_once) return;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "LightSpeedEngine")) continue;
+        g_apple_pin_scan_once = 1;
+        const uint8_t *hdr = (const uint8_t *)_dyld_get_image_header(i);
+        void *midp = mb_find_apple_pin_verify(hdr);
+        if (!midp) {
+            MBLogW(@"SSL-Pinning", @"⚠️ 未在 LSE 定位到 ApplePin mid, SPKI 补丁未装");
+            return;
+        }
+        uint64_t mid = (uint64_t)midp;
+        uint32_t *site = (uint32_t *)(mid + 0x124);   // cbnz w8, pin-loop
+        uint32_t *succ = (uint32_t *)(mid + 0x2DC);   // mov x19, #0
+        if (*succ != 0xD2800013u) {
+            MBLogW(@"SSL-Pinning", @"⚠️ 成功收尾 %p insn=0x%08x 不是 mov x19,#0, 放弃补丁", succ, *succ);
+            return;
+        }
+        int64_t rel = ((int64_t)succ - (int64_t)site) >> 2;
+        uint32_t b_insn = 0x14000000u | ((uint32_t)rel & 0x03FFFFFFu);
+        if (mb_patch_insn(site, 0x350000E8u, b_insn) == 0)
+            MBLogI(@"SSL-Pinning", @"✅ SPKI 循环已跳过: %p cbnz -> b %p (SecTrust 后直接当 pin 通过)", site, succ);
+        return;
+    }
+    if (!g_apple_pin_scan_once++)
+        MBLogW(@"SSL-Pinning", @"⚠️ LightSpeedEngine 未加载, ApplePin SPKI 补丁未安装");
 }
 
 // ----------------------------------------------------------------------------
@@ -1072,8 +1462,32 @@ static int my_EVP_EncryptUpdate(void *ctx, unsigned char *out, int *outlen, cons
     return orig_EVP_EncryptUpdate(ctx, out, outlen, in, inlen);
 }
 
+// libsodium AEAD: Fizz/Hawk 若走 ChaCha20-Poly1305, m 就是 TLS 记录明文 (仍含业务 E2EE)
+typedef int (*chacha_aead_t)(uint8_t *c, uint64_t *clen, const uint8_t *m, uint64_t mlen,
+                             const uint8_t *ad, uint64_t adlen, const uint8_t *nsec,
+                             const uint8_t *npub, const uint8_t *k);
+static chacha_aead_t orig_chacha_enc = NULL;
+static chacha_aead_t orig_chacha_dec = NULL;
+static int my_chacha_encrypt(uint8_t *c, uint64_t *clen, const uint8_t *m, uint64_t mlen,
+                             const uint8_t *ad, uint64_t adlen, const uint8_t *nsec,
+                             const uint8_t *npub, const uint8_t *k) {
+    if (m && mlen > 0 && mb_mns_capture_armed()) {
+        mb_dump_first_frame("chacha_enc", (void *)(uintptr_t)mlen, m, (size_t)mlen);
+    }
+    return orig_chacha_enc(c, clen, m, mlen, ad, adlen, nsec, npub, k);
+}
+static int my_chacha_decrypt(uint8_t *m, uint64_t *mlen, const uint8_t *c, uint64_t clen,
+                             const uint8_t *ad, uint64_t adlen, const uint8_t *nsec,
+                             const uint8_t *npub, const uint8_t *k) {
+    int rc = orig_chacha_dec(m, mlen, c, clen, ad, adlen, nsec, npub, k);
+    if (rc == 0 && m && mlen && *mlen > 0 && mb_mns_capture_armed()) {
+        mb_dump_first_frame("chacha_dec", (void *)(uintptr_t)(*mlen), m, (size_t)(*mlen));
+    }
+    return rc;
+}
+
 static void hook_lse_evp(void) {
-    if (orig_EVP_CipherUpdate && orig_EVP_EncryptUpdate) return;
+    if (orig_EVP_CipherUpdate && orig_EVP_EncryptUpdate && orig_chacha_enc && orig_chacha_dec) return;
     uint32_t cnt = _dyld_image_count();
     for (uint32_t i = 0; i < cnt; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -1091,6 +1505,16 @@ static void hook_lse_evp(void) {
             void *fn = dlsym(h, "EVP_EncryptUpdate");
             if (fn) { MSHookFunction(fn, (void *)my_EVP_EncryptUpdate, (void **)&orig_EVP_EncryptUpdate);
                       MBLogI(@"MQTT", @"✅ 定向挂钩 LightSpeedEngine EVP_EncryptUpdate (Fizz AEAD 前明文): %p", fn); }
+        }
+        if (!orig_chacha_enc) {
+            void *fn = dlsym(h, "crypto_aead_chacha20poly1305_ietf_encrypt");
+            if (fn) { MSHookFunction(fn, (void *)my_chacha_encrypt, (void **)&orig_chacha_enc);
+                      MBLogI(@"KEYLOG", @"✅ 挂钩 chacha20poly1305 encrypt (AEAD 前明文): %p", fn); }
+        }
+        if (!orig_chacha_dec) {
+            void *fn = dlsym(h, "crypto_aead_chacha20poly1305_ietf_decrypt");
+            if (fn) { MSHookFunction(fn, (void *)my_chacha_decrypt, (void **)&orig_chacha_dec);
+                      MBLogI(@"KEYLOG", @"✅ 挂钩 chacha20poly1305 decrypt (AEAD 后明文): %p", fn); }
         }
         return;
     }
@@ -1229,9 +1653,21 @@ static void hook_nw_connection_create(void) {
 // ----------------------------------------------------------------------------
 #define MNS_SYM_SECURETCP_ESTABLISH "_Z31MNSSecureTCPConnectionEstablishP24__MNSSecureTCPConnectionP16__MNSDNSResolverPK11__MCFStringiNSt3__16vectorIN8crossapp9tigonhttp3mns13SocketAddressENS6_9allocatorISB_EEEE"
 #define MNS_SYM_TCP_ESTABLISH       "_Z25MNSTCPConnectionEstablishP18__MNSTCPConnectionP16__MNSDNSResolverPK11__MCFStringiNSt3__16vectorIN8crossapp9tigonhttp3mns13SocketAddressENS6_9allocatorISB_EEEE"
-#define MNS_SYM_HTTPCLIENT_CREATE   "_Z31MNSHTTPClientCreateWithSettingsP14__MNSEventLoopS0_NSt3__110shared_ptrIN8crossapp9tigonhttp3mns12HTTPSettingsEEEPK8__MCFURLPK11__MCFString"
+// 真机 LSE 576 导出是 shared_ptr<EventLoop> 两份, 不是裸 P14__MNSEventLoop (旧 mangling 从未命中)
+#define MNS_SYM_HTTPCLIENT_CREATE   "_Z31MNSHTTPClientCreateWithSettingsNSt3__110shared_ptrIN8crossapp9tigonhttp3mns9EventLoopEEES5_NS0_INS3_12HTTPSettingsEEEPK8__MCFURLPK11__MCFString"
 #define MNS_SYM_HTTPCLIENT_SEND     "_Z24MNSHTTPClientSendRequestP15__MNSHTTPClientN8crossapp9tigonhttp3mns11HTTPRequestE22MNSHTTPClientCallbacksPPKv"
 #define MNS_SYM_GET_ALPN            "_ZNK8crossapp9tigonhttp3mns17SecureTCPSettings15getALPNProtocolEv"
+#define MNS_SYM_URL_CREATE          "_ZN8crossapp9tigonhttp3mns3URL16createWithStringERKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE"
+#define MNS_SYM_HTTPREQ_CTOR        "_ZN8crossapp9tigonhttp3mns11HTTPRequestC1ENSt3__117basic_string_viewIcNS3_11char_traitsIcEEEENS1_3URLEPK15__MCFDictionarybdbNS3_8optionalINS1_13SocketAddressEEE"
+#define MNS_SYM_SET_TLSBACKEND      "_ZN8crossapp9tigonhttp3mns17SecureTCPSettings13setTLSBackendE13MNSTLSBackend"
+#define MNS_SYM_SET_FORCEH2         "_ZN8crossapp9tigonhttp3mns12HTTPSettings13setForceHTTP2Eh"
+#define MNS_SYM_SET_EARLYDATA       "_ZN8crossapp9tigonhttp3mns17SecureTCPSettings18setEnableEarlyDataEb"
+#define MNS_SYM_TIGON_STACK_SEND    "_ZN8facebook5tigon10TigonStack11sendRequestERKNS0_12TigonRequestENSt3__110shared_ptrINS0_17TigonBodyProviderEEENS5_10unique_ptrINS0_14TigonCallbacksENS5_14default_deleteISA_EEEENS6_IN5folly17SequencedExecutorEEE"
+#define MNS_SYM_TIGON_ADDHDR        "_ZN8facebook5tigon12TigonRequest9addHeaderERKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEESA_"
+#define MNS_SYM_TIGON_CTOR          "_ZN8facebook5tigon12TigonRequestC1ERKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEESA_"
+#define MNS_SYM_TIGON_FINDHDR       "_ZNK8facebook5tigon12TigonRequest10findHeaderERKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE"
+#define MNS_SYM_SECURETCP_CREATE    "_Z28MNSSecureTCPConnectionCreateNSt3__110shared_ptrIN8crossapp9tigonhttp3mns9EventLoopEEEP31MNSSecureTCPConnectionCallbacksNS0_INS3_9DiskCacheEEENS0_INS3_17SecureTCPSettingsEEEPKv"
+#define MNS_SYM_SET_KEYLOG_URL      "_ZN8crossapp9tigonhttp3mns17SecureTCPSettings16setKeylogFileURLEPK8__MCFURL"
 
 // ---- gateway 建连首帧抓取窗口 (对比 Java H2/MQTT 差异) ----
 static volatile int64_t g_mns_capture_until_ms = 0;
@@ -1364,16 +1800,53 @@ static CFStringRef my_getALPNProtocol(void *self) {
 // 注意: 禁止全局 hook write()/send() —— 会在 libnetwork DNS/系统线程触发 EXC_BREAKPOINT
 // (见下方 %ctor 注释)。首帧靠 SecureTCPSend / LSE SSL_write / nw_connection_send / EVP。
 
-// MNSHTTPClientCreateWithSettings(evloop, evloop, shared_ptr<HTTPSettings>[隐式引用=1寄存器], MCFURL* url, MCFString*)
-typedef void* (*mns_httpclient_create_t)(void *ev1, void *ev2, void *settings, CFURLRef url, CFStringRef extra);
+// 安全猜测: 直接 ASCII / libc++ std::string / 一层指针解引用。非法地址用 vm_read, 不崩。
+static NSString *mb_guess_text(const void *p) {
+    if (!p) return nil;
+    uint8_t raw[32];
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)p, 24, (vm_address_t)raw, &got) != KERN_SUCCESS || got < 16)
+        return nil;
+    uint64_t w0 = 0, w1 = 0;
+    memcpy(&w0, raw, 8);
+    memcpy(&w1, raw + 8, 8);
+    if (w0 > 0x100000000ULL && w1 > 2 && w1 < 2048) {
+        uint8_t buf[2048];
+        vm_size_t n = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)w0, (vm_size_t)w1, (vm_address_t)buf, &n) == KERN_SUCCESS && n == w1) {
+            int ok = 0;
+            for (size_t i = 0; i < n && i < 12; i++) if (buf[i] >= 32 && buf[i] < 127) ok++;
+            if (ok >= 3) {
+                return [[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding];
+            }
+        }
+    }
+    if (raw[0] >= 32 && raw[0] < 127) {
+        uint8_t buf[512];
+        vm_size_t n = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)p, sizeof(buf), (vm_address_t)buf, &n) == KERN_SUCCESS && n > 3) {
+            size_t i = 0;
+            while (i < n && buf[i] >= 9 && buf[i] < 127) i++;
+            if (i >= 3) return [[NSString alloc] initWithBytes:buf length:i encoding:NSUTF8StringEncoding];
+        }
+    }
+    return nil;
+}
+
+// MNSHTTPClientCreateWithSettings(shared_ptr<EventLoop>, shared_ptr<EventLoop>, shared_ptr<HTTPSettings>, MCFURL*, MCFString*)
+// shared_ptr 占两寄存器, URL 落在 x6, extra 落在 x7; 只安全读, 不 CFGetTypeID 乱指针。
+typedef void* (*mns_httpclient_create_t)(void*,void*,void*,void*,void*,void*,void*,void*);
 static mns_httpclient_create_t orig_MNSHTTPClientCreateWithSettings = NULL;
-static void* my_MNSHTTPClientCreateWithSettings(void *ev1, void *ev2, void *settings, CFURLRef url, CFStringRef extra) {
+static void* my_MNSHTTPClientCreateWithSettings(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
     @try {
-        NSURL *u = url ? (__bridge NSURL *)url : nil;
-        NSString *e2 = extra ? (__bridge NSString *)extra : nil;
-        MBLogI(@"MNS_HTTP", @"🌐 [HTTPClientCreateWithSettings] MNS endpoint url=%@ extra=%@", u.absoluteString, e2);
+        NSString *u6 = mb_guess_text(a6);
+        NSString *u7 = mb_guess_text(a7);
+        MBLogI(@"MNS_HTTP", @"🌐 [HTTPClientCreateWithSettings] x6=%@ x7=%@", u6 ?: @"(nil)", u7 ?: @"(nil)");
+        if ((u6 && [u6 containsString:@"gateway"]) || (u7 && [u7 containsString:@"gateway"])) {
+            mb_arm_mns_first_frame("HTTPClientCreate", u6 ?: u7);
+        }
     } @catch (__unused NSException *e) {}
-    return orig_MNSHTTPClientCreateWithSettings(ev1, ev2, settings, url, extra);
+    return orig_MNSHTTPClientCreateWithSettings(a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
 // MNSHTTPClientSendRequest(client, HTTPRequest[隐式引用], callbacks, void**) —— 仅计数+指针, 不解析结构 (防崩)
@@ -1386,6 +1859,232 @@ static void* my_MNSHTTPClientSendRequest(void *client, void *req, void *callback
                ++g_mns_send_count, client, req);
     } @catch (__unused NSException *e) {}
     return orig_MNSHTTPClientSendRequest(client, req, callbacks, outTok);
+}
+
+// URL::createWithString(const std::string&) — MNS 组 URL 的统一入口, 能看到 gateway path / mqtt
+typedef void (*mns_url_create_t)(void *sret, const void *str);
+static mns_url_create_t orig_MNSURLCreateWithString = NULL;
+static int g_mns_url_n = 0;
+static void my_MNSURLCreateWithString(void *sret, const void *str) {
+    @try {
+        NSString *s = mb_guess_text(str);
+        int n = ++g_mns_url_n;
+        BOOL interesting = s && ([s containsString:@"gateway"] || [s.lowercaseString containsString:@"mqtt"]
+                                 || [s containsString:@"edge-mqtt"] || [s containsString:@":protocol"]
+                                 || [s containsString:@"CONNECT"]);
+        if (interesting || n <= 40 || (n % 200) == 0) {
+            MBLogI(@"MNS_URL", @"🔗 [URL::createWithString] #%d%@ %@", n, interesting ? @" ★" : @"", s ?: @"(unreadable)");
+        }
+        if (interesting && s && [s containsString:@"gateway"]) {
+            mb_arm_mns_first_frame("URL_create", s);
+        }
+    } @catch (__unused NSException *e) {}
+    orig_MNSURLCreateWithString(sret, str);
+}
+
+// v37 扫到 TigonRequest: +0x68 完整 URL, +0x80 scheme, +0x98 host, +0xa0 域。只读, 不改对象。
+static int g_tigon_gw_dump = 0;
+static void mb_dump_tigon_if_gateway(const void *req, const char *why) {
+    if (!req || g_tigon_gw_dump >= 24) return;
+    void *phost = NULL;
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)req + 0x98, 8, (vm_address_t)&phost, &got) != KERN_SUCCESS)
+        return;
+    NSString *host = mb_guess_text(phost);
+    if (!host) host = mb_guess_text((const uint8_t *)req + 0x98);
+    if (!host || ![host containsString:@"gateway"]) return;
+    g_tigon_gw_dump++;
+    static const int offs[] = { 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8 };
+    NSMutableString *hits = [NSMutableString string];
+    for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+        void *p = NULL;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)req + offs[i], 8, (vm_address_t)&p, &got) != KERN_SUCCESS)
+            continue;
+        NSString *s = mb_guess_text(p);
+        if (!s || s.length < 2) s = mb_guess_text((const uint8_t *)req + offs[i]);
+        if (s && s.length >= 2)
+            [hits appendFormat:@" [%x]%@ ", offs[i], s];
+    }
+    MBLogI(@"TIGON", @"🔎 [%s] gateway req=%p #%d%@", why, req, g_tigon_gw_dump, hits.length ? hits : @" (no fields)");
+    mb_arm_mns_first_frame(why, host);
+}
+
+// TigonRequest::addHeader(const string& name, const string& value) — 352B, 抓 :path / :protocol / :authority
+typedef void (*tigon_addhdr_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static tigon_addhdr_t orig_TigonAddHeader = NULL;
+static int g_tigon_hdr_n = 0;
+static void my_TigonAddHeader(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    @try {
+        NSString *name = mb_guess_text(a1);
+        NSString *val = mb_guess_text(a2);
+        int n = ++g_tigon_hdr_n;
+        BOOL interesting = (name && ([name hasPrefix:@":"] || [name.lowercaseString containsString:@"protocol"]
+                                     || [name.lowercaseString containsString:@"mqtt"]))
+                        || (val && ([val containsString:@"gateway"] || [val.lowercaseString containsString:@"mqtt"]
+                                    || [val containsString:@"CONNECT"]));
+        if (interesting || n <= 40 || (n % 400) == 0) {
+            MBLogI(@"TIGON", @"📎 [addHeader] #%d%@ %@ = %@", n, interesting ? @" ★" : @"",
+                   name ?: @"(?)", val ?: @"(?)");
+        }
+        if (interesting) mb_dump_tigon_if_gateway(a0, "addHeader");
+    } @catch (__unused NSException *e) {}
+    orig_TigonAddHeader(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+// TigonRequest::TigonRequest(const string&, const string&) — 292B, 通常 method + url
+typedef void (*tigon_ctor_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static tigon_ctor_t orig_TigonReqCtor = NULL;
+static int g_tigon_ctor_n = 0;
+static void my_TigonReqCtor(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    orig_TigonReqCtor(a0, a1, a2, a3, a4, a5, a6, a7);
+    @try {
+        NSString *s1 = mb_guess_text(a1);
+        NSString *s2 = mb_guess_text(a2);
+        int n = ++g_tigon_ctor_n;
+        BOOL interesting = (s1 && ([s1 containsString:@"gateway"] || [s1.lowercaseString containsString:@"mqtt"]
+                                   || [s1 isEqualToString:@"CONNECT"]))
+                        || (s2 && ([s2 containsString:@"gateway"] || [s2.lowercaseString containsString:@"mqtt"]));
+        if (interesting || n <= 30 || (n % 200) == 0) {
+            MBLogI(@"TIGON", @"📨 [TigonRequest ctor] #%d%@ a1=%@ a2=%@", n, interesting ? @" ★" : @"",
+                   s1 ?: @"(?)", s2 ?: @"(?)");
+        }
+        if (interesting) mb_dump_tigon_if_gateway(a0, "TigonReqCtor");
+    } @catch (__unused NSException *e) {}
+}
+
+// TigonRequest::findHeader — 2092B, this=请求; 只在 host 含 gateway 时 dump 偏移
+typedef void* (*tigon_findhdr_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static tigon_findhdr_t orig_TigonFindHeader = NULL;
+static void *my_TigonFindHeader(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    void *r = orig_TigonFindHeader(a0, a1, a2, a3, a4, a5, a6, a7);
+    @try { mb_dump_tigon_if_gateway(a0, "findHeader"); } @catch (__unused NSException *e) {}
+    return r;
+}
+
+// HTTPRequest::HTTPRequest(string_view method, URL, headers, ...)
+// string_view = {ptr,len} 在 x1/x2
+typedef void (*mns_httpreq_ctor_t)(void *self, const void *mdata, unsigned long mlen, void *a3, void *a4, void *a5, void *a6, void *a7);
+static mns_httpreq_ctor_t orig_MNSHTTPRequestCtor = NULL;
+static int g_mns_req_n = 0;
+static void my_MNSHTTPRequestCtor(void *self, const void *mdata, unsigned long mlen, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    orig_MNSHTTPRequestCtor(self, mdata, mlen, a3, a4, a5, a6, a7);
+    @try {
+        NSString *method = nil;
+        if (mdata && mlen > 0 && mlen < 32) {
+            uint8_t buf[32];
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)mdata, (vm_size_t)mlen, (vm_address_t)buf, &got) == KERN_SUCCESS && got == mlen) {
+                method = [[NSString alloc] initWithBytes:buf length:(NSUInteger)mlen encoding:NSUTF8StringEncoding];
+            }
+        }
+        int n = ++g_mns_req_n;
+        BOOL interesting = method && ([method isEqualToString:@"CONNECT"] || [method isEqualToString:@"connect"]);
+        if (interesting || n <= 30 || (n % 200) == 0) {
+            MBLogI(@"MNS_REQ", @"📨 [HTTPRequest ctor] #%d method=%@ self=%p", n, method ?: @"(?)", self);
+        }
+        if (interesting) {
+            mb_arm_mns_first_frame("HTTPRequest_CONNECT", method);
+            mb_dump_first_frame("HTTPRequest_method", self, mdata, (size_t)mlen);
+        }
+    } @catch (__unused NSException *e) {}
+}
+
+// MNSHTTPClientProvideBodyBytes — 签名未反汇编确认, 8 寄存器透传; 在 x1/x2 或 x2/x3 找 (buf,len)
+typedef void (*mns_provide_body_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static mns_provide_body_t orig_MNSHTTPClientProvideBodyBytes = NULL;
+static int g_mns_body_n = 0;
+static void my_MNSHTTPClientProvideBodyBytes(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    @try {
+        int n = ++g_mns_body_n;
+        void *cands[] = { a1, a2, a3 };
+        unsigned long lens[] = { (unsigned long)a2, (unsigned long)a3, (unsigned long)a4 };
+        for (int i = 0; i < 3; i++) {
+            unsigned long len = lens[i];
+            if (!cands[i] || len < 2 || len > (256 * 1024)) continue;
+            uint8_t first = 0;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)cands[i], 1, (vm_address_t)&first, &got) != KERN_SUCCESS)
+                continue;
+            if (mb_mns_capture_armed() || n <= 20) {
+                mb_dump_first_frame("HTTPClientBody", a0, cands[i], (size_t)len);
+            }
+            if (n <= 20 || (n % 100) == 0) {
+                MBLogI(@"MNS_BODY", @"📦 [ProvideBodyBytes] #%d x0=%p buf=x%d len=%lu first=0x%02x",
+                       n, a0, i + 1, len, first);
+            }
+            break;
+        }
+    } @catch (__unused NSException *e) {}
+    orig_MNSHTTPClientProvideBodyBytes(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+typedef void (*mns_end_body_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static mns_end_body_t orig_MNSHTTPClientEndRequestBody = NULL;
+static void my_MNSHTTPClientEndRequestBody(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    MBLogRateLimited(1.0, MBLogLevelInfo, @"MNS_BODY", @"📦 [EndRequestBody] x0=%p", a0);
+    orig_MNSHTTPClientEndRequestBody(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+typedef void (*mns_set_tlsbackend_t)(void *self, int backend);
+static mns_set_tlsbackend_t orig_setTLSBackend = NULL;
+static void my_setTLSBackend(void *self, int backend) {
+    MBLogI(@"MNS_TLS", @"🔐 [SecureTCPSettings::setTLSBackend] settings=%p backend=%d (0=Fizz? 1=BoringSSL?)", self, backend);
+    orig_setTLSBackend(self, backend);
+}
+
+typedef void (*mns_set_u8_t)(void *self, unsigned char v);
+static mns_set_u8_t orig_setForceHTTP2 = NULL;
+static mns_set_u8_t orig_setEnableEarlyData = NULL;
+static void my_setForceHTTP2(void *self, unsigned char v) {
+    MBLogI(@"MNS_TLS", @"🔐 [HTTPSettings::setForceHTTP2] settings=%p v=%u", self, (unsigned)v);
+    orig_setForceHTTP2(self, v);
+}
+static void my_setEnableEarlyData(void *self, unsigned char v) {
+    MBLogI(@"MNS_TLS", @"🔐 [SecureTCPSettings::setEnableEarlyData] settings=%p v=%u", self, (unsigned)v);
+    orig_setEnableEarlyData(self, v);
+}
+
+typedef void (*mns_log_endpoint_t)(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5);
+static mns_log_endpoint_t orig_ACTLogMNSEndpoint = NULL;
+static void my_ACTLogMNSEndpoint(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5) {
+    @try {
+        MBLogI(@"MNS_EP", @"📡 [ACTConnectivityLogConnectionMNSEndpoint] a0=%@ a1=%@ a2=%@ a3=%@",
+               mb_guess_text(a0) ?: @"(?)", mb_guess_text(a1) ?: @"(?)",
+               mb_guess_text(a2) ?: @"(?)", mb_guess_text(a3) ?: @"(?)");
+    } @catch (__unused NSException *e) {}
+    orig_ACTLogMNSEndpoint(a0, a1, a2, a3, a4, a5);
+}
+
+// TigonStack::sendRequest — 扫描 TigonRequest 前 0x140 找可打印 URL (gateway/mqtt 才打全量)
+typedef void (*tigon_send_t)(void*,void*,void*,void*,void*,void*,void*,void*);
+static tigon_send_t orig_TigonStackSend = NULL;
+static int g_tigon_send_n = 0;
+static void my_TigonStackSend(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6, void *a7) {
+    @try {
+        int n = ++g_tigon_send_n;
+        NSMutableString *hits = [NSMutableString string];
+        const void *req = a1;
+        if (req) {
+            for (int off = 0; off < 0x140; off += 8) {
+                void *p = NULL;
+                vm_size_t got = 0;
+                if (vm_read_overwrite(mach_task_self(), (vm_address_t)req + off, 8, (vm_address_t)&p, &got) != KERN_SUCCESS)
+                    continue;
+                NSString *s = mb_guess_text(p);
+                if (!s || s.length < 4) s = mb_guess_text((const uint8_t *)req + off);
+                if (s && s.length >= 4 && ( [s containsString:@"http"] || [s containsString:@"gateway"]
+                        || [s.lowercaseString containsString:@"mqtt"] || [s containsString:@"facebook"] )) {
+                    [hits appendFormat:@" [%x]%@ ", off, s];
+                }
+            }
+        }
+        BOOL interesting = hits.length > 0 && ([hits containsString:@"gateway"] || [hits.lowercaseString containsString:@"mqtt"]);
+        if (interesting || n <= 15 || (n % 500) == 0) {
+            MBLogI(@"TIGON", @"📤 [TigonStack::sendRequest] #%d%@%@", n, interesting ? @" ★" : @"", hits.length ? hits : @" (no url)");
+        }
+        if (interesting) mb_arm_mns_first_frame("TigonStack", hits);
+    } @catch (__unused NSException *e) {}
+    orig_TigonStackSend(a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
 // ----------------------------------------------------------------------------
@@ -1542,7 +2241,9 @@ static void hook_lse_writechain(void) {
 static void try_hook_ssl_symbols(void) {
     hook_lse_boringssl();
     hook_lse_evp();
+    hook_evpcipher_create();
     hook_lse_certpin();  // MNS/Fizz pinning 绕过: 定向 hook LSE 内部 X509_verify_cert
+    hook_lse_apple_pin_verify();
     // hook_lse_writechain();  // 已禁用: 候选偏移非真实函数入口, MSHookFunction 打在函数中间 → 控制流损坏 → 栈溢出闪退
     hook_nw_connection_send();
     hook_nw_connection_create();
@@ -1624,6 +2325,18 @@ static void try_hook_ssl_symbols(void) {
             MBLogW(@"SSL-Pinning", @"⚠️ 未找到 MBICertPinningHandleChallenge");
         }
     }
+    if (!p_setKeylogFileURL) {
+        p_setKeylogFileURL = (mns_set_keylog_url_t)dlsym(RTLD_DEFAULT, MNS_SYM_SET_KEYLOG_URL);
+        if (p_setKeylogFileURL)
+            MBLogI(@"KEYLOG", @"✅ 取得 setKeylogFileURL (只调用不 hook): %p", p_setKeylogFileURL);
+    }
+    if (!orig_MNSSecureTCPConnectionCreate) {
+        void *fn = dlsym(RTLD_DEFAULT, MNS_SYM_SECURETCP_CREATE);
+        if (fn) {
+            MSHookFunction(fn, (void *)my_MNSSecureTCPConnectionCreate, (void **)&orig_MNSSecureTCPConnectionCreate);
+            MBLogI(@"KEYLOG", @"✅ 挂钩 MNSSecureTCPConnectionCreate (924B, 启用 Fizz keylog): %p", fn);
+        }
+    }
     if (!orig_MNSSecureTCPConnectionEstablish) {
         void *fn = dlsym(RTLD_DEFAULT, MNS_SYM_SECURETCP_ESTABLISH);
         if (fn) {
@@ -1682,6 +2395,8 @@ static void try_hook_ssl_symbols(void) {
             MBLogW(@"SSL-Pinning", @"⚠️ 未找到 MNSTCPConnectionSend");
         }
     }
+    // v42: TigonRequest ctor / URL::create / findHeader / addHeader 全部停用。
+    // v40 ctor 已抓到 POST https://gateway.facebook.com/lightspeed, 但 ctor#2 与 findHeader 会 SIGBUS。
     // [已禁用] getALPNProtocol hook:
     // 调用约定/返回值并非稳定 MCFString*, 在 DB 打开线程触发 objc_retain(0x1) -> EXC_BAD_ACCESS,
     // 导致 Messenger 启动即崩、gateway 建连抓不到。ALPN 改由 VPN ClientHello / Java 侧观测。
@@ -2461,7 +3176,7 @@ static int my_MCCWStreamRegisterReceiveHandler(void *transport, void *handler, v
         NSString *model = [[UIDevice currentDevice] model] ?: @"Unknown";
 
         MBLogI(@"Init", @"=================================================================");
-        MBLogI(@"Init", @"🎉 MessengerBypass 插件加载就绪 (E2EE 深度监控增强版)");
+        MBLogI(@"Init", @"🎉 MessengerBypass 插件加载就绪 (v44 TLS明文: AEAD/keylog, 不调 setKeylogFileURL)");
         MBLogI(@"Init", @"📦 目标应用 BundleID : %@", bundleId);
         MBLogI(@"Init", @"📱 设备型号 & iOS版本: %@ (iOS %@)", model, osVersion);
         MBLogI(@"Init", @"📌 应用版本号       : v%@ (Build %@)", appVersion, buildVersion);
@@ -2570,6 +3285,31 @@ static int my_MCCWStreamRegisterReceiveHandler(void *transport, void *handler, v
         // 注册 SSL 动态库监听与 Hook
         try_hook_ssl_symbols();
         _dyld_register_func_for_add_image(on_image_added);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            static const char *kVerifCls[] = {
+                "MNSCertificateVerifier", "MNSCertificateVerifierApple",
+                "MNSCertificateVerifierAppleCrlUtil", "MNSCertificateVerifierAdapter", nil
+            };
+            for (int i = 0; kVerifCls[i]; i++) {
+                Class c = objc_getClass(kVerifCls[i]);
+                if (!c) {
+                    MBLogI(@"SSL-Pinning", @"🔎 [Cls] %s = (nil, 不是 ObjC / 未加载)", kVerifCls[i]);
+                    continue;
+                }
+                unsigned n = 0;
+                Method *ms = class_copyMethodList(c, &n);
+                unsigned ni = 0;
+                Method *ims = class_copyMethodList(object_getClass(c), &ni);
+                NSMutableString *s = [NSMutableString string];
+                for (unsigned j = 0; j < ni; j++)
+                    [s appendFormat:@" +%s", sel_getName(method_getName(ims[j]))];
+                for (unsigned j = 0; j < n; j++)
+                    [s appendFormat:@" -%s", sel_getName(method_getName(ms[j]))];
+                if (ims) free(ims);
+                if (ms) free(ms);
+                MBLogI(@"SSL-Pinning", @"🔎 [Cls] %s methods=%@", kVerifCls[i], s.length ? s : @"(none)");
+            }
+        });
 
         // 注册 Mailbox SDK 发信成功通知监听
         [[NSNotificationCenter defaultCenter] addObserverForName:nil object:nil queue:nil usingBlock:^(NSNotification *note) {
