@@ -1,9 +1,0 @@
-Package: com.securityresearcher.telegrambypass
-Name: TelegramBypass
-Depends: ellekit | mobilesubstrate
-Version: 1.0.0
-Architecture: iphoneos-arm
-Description: Automated security protection bypass tweak for Telegram
-Maintainer: SecurityResearcher
-Author: SecurityResearcher
-Section: Tweaks

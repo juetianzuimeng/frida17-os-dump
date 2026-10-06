@@ -1,9 +1,0 @@
-Package: com.securityresearcher.whatsappbypass
-Name: WhatsAppBypass
-Depends: ellekit | mobilesubstrate
-Version: 1.0.0
-Architecture: iphoneos-arm
-Description: Automated security protection bypass tweak for ‎WA Business
-Maintainer: SecurityResearcher
-Author: SecurityResearcher
-Section: Tweaks
