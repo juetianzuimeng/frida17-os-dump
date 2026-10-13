@@ -91,6 +91,13 @@ python3 analyze.py --demangle _TtC10Calculator16CalculatorLayout
 # 8. Headless 精准函数反汇编 (免开 IDA 秒看 ARM64 汇编实现，支持带内联字符串与系统调用注释)
 python3 analyze.py -f Messenger.ipa --disasm 0x1E9B34
 python3 analyze.py -f Messenger.ipa --disasm ptrace
+
+# 9. ARM64 函数调用图追溯 (Callers 上游调用者反查 / Callees 下游子调用依赖树)
+python3 analyze.py -f Messenger.ipa --callers 0x47A68
+python3 analyze.py -f Messenger.ipa --callees 0x746D90
+
+# 10. 静态分析一键派生 Frida 动态追踪探针脚本 (自动生成带入参探测、准确调用栈与耗时统计的 JS 探针)
+python3 analyze.py -f Messenger.ipa --gen-trace 0x746D90,0x47A68 --trace-output ./trace_demo.js
 ```
 
 #### 覆盖的检测维度：

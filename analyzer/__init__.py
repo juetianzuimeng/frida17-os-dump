@@ -9,6 +9,8 @@ from .objc_parser import ObjCParser, ObjCClass, ObjCCategory, ObjCMethod, ObjCMe
 from .xref_scanner import XrefScanner, XrefReport, XrefResult
 from .demangler import SwiftDemangler
 from .disassembler import Disassembler, DisasmInstruction, DisasmFunction
+from .call_graph import CallGraphAnalyzer, CallEdge, CallGraphReport
+from .tracer_generator import TracerGenerator
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -29,6 +31,10 @@ __all__ = [
     "Disassembler",
     "DisasmInstruction",
     "DisasmFunction",
+    "CallGraphAnalyzer",
+    "CallEdge",
+    "CallGraphReport",
+    "TracerGenerator",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",

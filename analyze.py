@@ -113,6 +113,30 @@ def parse_args():
         help="指定反汇编的最大指令条数 (默认: 40 条，遇到 ret 自动停止)"
     )
     parser.add_argument(
+        "--callers",
+        dest="callers_target",
+        default=None,
+        help="分析 ARM64 函数调用图：查找谁调用了目标函数 (如: --callers 0x47A68)"
+    )
+    parser.add_argument(
+        "--callees",
+        dest="callees_target",
+        default=None,
+        help="分析 ARM64 函数调用图：查找目标函数内部调用了哪些子函数 (如: --callees 0x746D90)"
+    )
+    parser.add_argument(
+        "--gen-trace",
+        dest="gen_trace_targets",
+        default=None,
+        help="一键派生 Frida 动态追踪探针脚本 (支持逗号分隔多个偏移/符号，如: --gen-trace 0x746D90 或 --gen-trace 0x47A68,0x746D90)"
+    )
+    parser.add_argument(
+        "--trace-output",
+        dest="trace_output_path",
+        default=None,
+        help="指定生成的 Frida 探针 JS 脚本保存路径 (未指定则默认在控制台输出)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -183,6 +207,16 @@ def main():
         # 3.7. 精准反汇编与代码片段查看
         if args.disasm_target:
             handle_disasm(pkg_info, args.disasm_target, args.disasm_count)
+
+        # 3.8. 函数调用图分析 (Call Graph: Callers & Callees)
+        if args.callers_target:
+            handle_call_graph(pkg_info, mode="callers", target=args.callers_target)
+        if args.callees_target:
+            handle_call_graph(pkg_info, mode="callees", target=args.callees_target)
+
+        # 3.9. Frida 动态追踪探针一键派生
+        if args.gen_trace_targets:
+            handle_gen_trace(pkg_info, args.gen_trace_targets, args.trace_output_path)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -392,6 +426,148 @@ def handle_disasm(pkg_info, target: str, count: int = 40):
     if total_funcs == 0:
         print(f"\033[90m  未在任何二进制中解析到与 '{target}' 对应的有效函数入口或交叉引用调用者。\033[0m")
     print("\n" + "=" * 80 + "\n")
+
+
+def handle_call_graph(pkg_info, mode: str, target: str):
+    """分析 ARM64 函数调用图 (Callers 或 Callees)"""
+    from analyzer.call_graph import CallGraphAnalyzer
+    from analyzer.disassembler import Disassembler
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    mode_name = "上游调用者 (Callers)" if mode == "callers" else "下游子调用 (Callees)"
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;34m[+] ARM64 函数调用图分析 ({mode_name}) — 目标: '{target}'\033[0m")
+    print("=" * 80)
+
+    total_edges = 0
+    for bin_info in targets:
+        if not bin_info:
+            continue
+
+        cg = CallGraphAnalyzer(bin_info.abs_path)
+        dis = Disassembler(bin_info.abs_path)
+
+        resolved_list = dis.resolve_target(target)
+        if not resolved_list:
+            continue
+
+        for label, va in resolved_list[:5]:
+            if mode == "callers":
+                edges = cg.get_callers(va)
+                if not edges:
+                    continue
+                print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数: func@0x{va:X} ({label})\033[0m  \033[90m(发现 {len(edges)} 处调用来源)\033[0m")
+                for i, edge in enumerate(edges[:30], 1):
+                    delta = edge.call_site_va - edge.caller_va
+                    delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
+                    print(
+                        f"      \033[96m[{i:02d}] func@0x{edge.caller_va:X}\033[0m"
+                        f"  \033[90m(指令地址: 0x{edge.call_site_va:X}, 偏移动态: {delta_str})\033[0m"
+                        f"  \033[1;33mBL -> 0x{edge.target_va:X}\033[0m"
+                    )
+                if len(edges) > 30:
+                    print(f"      \033[90m... 还有 {len(edges) - 30} 处调用来源未列出\033[0m")
+                total_edges += len(edges)
+            else:
+                edges = cg.get_callees(va, from_exact_addr=True)
+                if not edges:
+                    edges = cg.get_callees(va, from_exact_addr=False)
+                if not edges:
+                    continue
+                print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数/位置: 0x{va:X} ({label})\033[0m  \033[90m(探测到 {len(edges)} 处子调用)\033[0m")
+                for i, edge in enumerate(edges[:30], 1):
+                    delta = edge.call_site_va - edge.caller_va
+                    delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
+                    print(
+                        f"      \033[96m[{i:02d}] 指令 0x{edge.call_site_va:X} ({delta_str})\033[0m"
+                        f"  \033[1;33mBL -> func@0x{edge.target_va:X}\033[0m"
+                    )
+                if len(edges) > 30:
+                    print(f"      \033[90m... 还有 {len(edges) - 30} 处子调用未列出\033[0m")
+                total_edges += len(edges)
+
+    if total_edges == 0:
+        print(f"\033[90m  未在二进制中检测到与 '{target}' 相关的有效调用边。\033[0m")
+    print("\n" + "=" * 80 + "\n")
+
+
+def handle_gen_trace(pkg_info, targets_str: str, output_path: str = None):
+    """一键生成 Frida 动态追踪探针脚本"""
+    from analyzer.tracer_generator import TracerGenerator
+    from analyzer.disassembler import Disassembler
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    raw_targets = [t.strip() for t in targets_str.split(",") if t.strip()]
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;32m[+] Frida 动态追踪探针一键派生 (Dynamic Tracer Generator)\033[0m")
+    print(f"  目标列表: {raw_targets}")
+    print("=" * 80)
+
+    module_targets = {}
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        dis = Disassembler(bin_info.abs_path)
+        for t in raw_targets:
+            resolved = dis.resolve_target(t)
+            for label, va in resolved:
+                base = dis._image_base or 0x100000000
+                rva = va - base if va >= base else va
+                module_targets.setdefault(bin_info.name, []).append((label, rva))
+
+    if not module_targets:
+        primary_mod = pkg_info.executable_name or (pkg_info.main_binary.name if pkg_info.main_binary else "App")
+        fallback_list = []
+        for t in raw_targets:
+            try:
+                val = int(t, 16) if t.lower().startswith("0x") else int(t, 16)
+                fallback_list.append((f"sub_{val:X}", val))
+            except ValueError:
+                pass
+        if fallback_list:
+            module_targets[primary_mod] = fallback_list
+
+    if not module_targets:
+        print(f"\033[91m[-] 无法解析输入的目标: {targets_str}\033[0m")
+        return
+
+    combined_scripts = []
+    for mod_name, trace_list in module_targets.items():
+        seen_rvas = set()
+        deduped = []
+        for lbl, rva in trace_list:
+            if rva not in seen_rvas:
+                seen_rvas.add(rva)
+                deduped.append((lbl, rva))
+
+        print(f"\n  \033[94m[*] 模块 [{mod_name}]: 锁定 {len(deduped)} 个拦截探针\033[0m")
+        for lbl, rva in deduped:
+            print(f"      → \033[96m{lbl}\033[0m (Offset: \033[1;33m0x{rva:X}\033[0m)")
+
+        js = TracerGenerator.generate_script(mod_name, deduped)
+        combined_scripts.append(js)
+
+    full_script = "\n\n".join(combined_scripts)
+
+    if output_path:
+        out_p = os.path.abspath(output_path)
+        out_dir = os.path.dirname(out_p)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            f.write(full_script)
+        print(f"\n\033[1;32m[+] 探针脚本已成功导出至: {out_p}\033[0m")
+        bundle_id = pkg_info.bundle_id or "<BundleID>"
+        print(f"  \033[93m建议启动命令:\033[0m")
+        print(f"    \033[1mfrida -U -f {bundle_id} -l {output_path} --no-pause\033[0m\n")
+    else:
+        print("\n" + "-" * 80)
+        print("\033[90m// Frida 探针 JS 脚本代码 (可保存为 .js 使用):\033[0m\n")
+        print(full_script)
+        print("-" * 80 + "\n")
 
 
 if __name__ == "__main__":

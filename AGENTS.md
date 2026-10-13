@@ -15,25 +15,31 @@
 - **触发时机**: 当你在业务项目中需要深入分析官方的底层控制流、C++ 汇编结构或导出私有头文件时。
 - **AI 行动指南**: 确保手机 USB 已连接且 App 在前台，调用该脚本将其砸壳并拉取到本地，供 IDA 或 Hopper 等工具（或本库的 `analyze.py`）分析。
 
-### 2. 静态安全防护检测、ObjC/Swift 逆向、Xrefs 交叉引用与 Headless 反汇编 (Static Security, Metadata, Xrefs & Disasm)
+### 2. 静态安全防护检测、ObjC/Swift 逆向、Xrefs 交叉引用、Headless 反汇编、调用图与动态探针派生
 - **调用脚本**: 
   - 常规安全分析: `python3 analyze.py -f <target.ipa>`
   - 导出/检索类与方法定义 (支持 Swift 还原名检索): `python3 analyze.py -f <target.ipa> --dump-objc [Keyword]`
   - ARM64 交叉引用反查 (定位敏感特征引用函数): `python3 analyze.py -f <target.ipa> --xrefs [Keyword]`
   - Headless 精准函数反汇编 (免开 IDA 秒看函数汇编): `python3 analyze.py -f <target.ipa> --disasm <OffsetOrSymbol>`
+  - ARM64 函数调用图追溯 (反查调用者与子调用树): 
+    - 查谁调用了它 (上游调用链): `python3 analyze.py -f <target.ipa> --callers <Offset/Symbol>`
+    - 查它调用了谁 (下游子调用): `python3 analyze.py -f <target.ipa> --callees <Offset/Symbol>`
+  - 静态一键派生 Frida 动态追踪探针: `python3 analyze.py -f <target.ipa> --gen-trace <Offset1,Offset2> [--trace-output trace.js]`
   - 独立 Swift 混淆符号还原: `python3 analyze.py --demangle <MangledSymbol>`
 - **触发时机**: 
   1. 面对全新 App 的“摸底”阶段：探测应用是否有**反调试 (ptrace/sysctl)**、**越狱检测**、**强 SSL Pinning** 或对 **Frida 的查杀**；静态报告会自动标识特征被哪个函数引用 (`func@0x...`)；
   2. **逆向业务协议或符号被 strip 剥离时**：需要快速掌握 App 内部有哪些 Controller、Manager、Service，或寻找特定业务关键字（如 `Message`、`Session`、`Socket`、`Crypto`）的类名与方法签名时；
   3. **定位敏感调用点以实施精确 Hook 时**：通过 `--xrefs <keyword>` 秒级反查引用该特征的汇编函数偏移 (`caller_func_offset`)，免去在 IDA 中手动交叉引用的繁琐操作；
   4. **深入判断函数底层实现（免开 IDA / Hopper）**：拿到函数偏移或发现特征后，通过 `--disasm <Offset/Symbol>` 直接截取该函数的 ARM64 汇编指令片段（带字符串常量内联注释与系统调用识别），秒级掌握该函数的具体逻辑与返回时机；
-  5. **遇到 Swift 混淆名时**：解析器已原生集成 Swift Demangler，自动将 `_TtC...` 还原为 `Namespace.Class`。
+  5. **梳理调用链与核心业务主路径**：通过 `--callers` 快速理清某底层 API 是由哪些业务函数调起（回溯触发源），通过 `--callees` 顺藤摸瓜掌握该函数内部按序触发的子任务（理清算法分发流程）；
+  6. **快速进入真机动态验证闭环**：通过 `--gen-trace <Offsets>` 一键生成具备自动 ASLR 基址重定位、智能入参嗅探、调用栈打印与耗时统计的 Frida 探针，直接上机验证。
 - **AI 行动指南**: 
   - 给它喂入砸壳后的 IPA，工具会自动解析 `__objc_classlist`、`__objc_catlist` 并建立 ARM64 指令 xrefs；
   - 若需要定位特定业务类，运行 `python3 analyze.py -f <target.ipa> --dump-objc <Keyword>` 快速打印 `@interface` 结构（含 Swift 还原标签）；
   - 若需要定位反调试/防护逻辑执行体，运行 `python3 analyze.py -f <target.ipa> --xrefs <keyword>` 提取调用者函数 Offset；
   - 若需要快速研判函数控制流，运行 `python3 analyze.py -f <target.ipa> --disasm <Offset>` 查看汇编实现，快速决定 Hook 点或 Patch 策略；
-  - 基于安全检测报告，有的放矢地决定要 Hook 掉哪些防护函数。
+  - 若需要回溯业务调用链路，运行 `python3 analyze.py -f <target.ipa> --callers <Offset>` 或 `--callees <Offset>` 快速建立调用图；
+  - 若需要立刻上机验证，运行 `python3 analyze.py -f <target.ipa> --gen-trace <Offset> -o trace.js` 生成探针并挂钩目标 App。
 
 ### 3. Tweak 越狱插件自动生成 (Tweak Scaffolding)
 - **调用脚本**: `python3 gen_tweak.py -f <target.ipa> -o ./<App>Bypass`
