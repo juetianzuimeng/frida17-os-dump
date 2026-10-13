@@ -15,6 +15,8 @@ import struct
 import subprocess
 from typing import List, Set, Dict, Any, Tuple, Optional
 from .rules.base import TargetBinaryInfo
+from .objc_parser import ObjCParser
+from .xref_scanner import XrefScanner
 
 
 # Mach-O Magic 常量
@@ -85,7 +87,13 @@ class MachOParser:
         # 3. 提取外部导入/导出符号（结合 nm 工具与内置解析）
         self._extract_symbols_via_tool(binary_info)
 
-        # 4. 判断 Stack Canary 和 ARC
+        # 4. 解析 Objective-C 运行时元数据 (Class, Category, Selector, Ivar, Property)
+        self._parse_objc_metadata(binary_info)
+
+        # 5. 建立 ARM64 交叉引用表（仅主二进制，按需延迟）
+        self._build_xrefs(binary_info)
+
+        # 6. 判断 Stack Canary 和 ARC
         self._check_compiler_protections(binary_info)
 
         return binary_info
@@ -305,3 +313,111 @@ class MachOParser:
         elif cputype == CPU_TYPE_X86:
             return "i386"
         return f"cpu_{cputype}"
+
+    def _parse_objc_metadata(self, info: TargetBinaryInfo):
+        """解析 64 位 Mach-O 中的 Objective-C 类定义与分类扩展"""
+        try:
+            slices = self._get_binary_slices()
+            best_slice = None
+            for offset, size, arch_str in slices:
+                if "arm64" in arch_str:
+                    best_slice = (offset, size)
+                    break
+                elif "64" in arch_str and best_slice is None:
+                    best_slice = (offset, size)
+
+            if not best_slice and slices:
+                best_slice = (slices[0][0], slices[0][1])
+
+            if best_slice:
+                offset, size = best_slice
+                objc_parser = ObjCParser(self.file_path, slice_offset=offset, slice_size=size)
+                metadata = objc_parser.parse()
+                info.objc_classes = metadata.classes
+                info.objc_categories = metadata.categories
+
+                # 将提取出的方法与类名注入 strings 与 exports，打破 strip 符号剥离限制
+                for s in metadata.selectors:
+                    info.strings.add(s)
+                    info.exports.add(s)
+                for c in metadata.class_names:
+                    info.strings.add(c)
+
+                # 更新全文检索内容
+                info.text_content = "\n".join(info.strings)
+        except Exception:
+            pass
+
+    def _get_binary_slices(self) -> List[Tuple[int, int, str]]:
+        """获取 Mach-O 二进制的所有架构切片 (offset, size, arch_name)"""
+        slices: List[Tuple[int, int, str]] = []
+        if not os.path.isfile(self.file_path):
+            return slices
+
+        try:
+            with open(self.file_path, "rb") as f:
+                header_bytes = f.read(4)
+                if len(header_bytes) < 4:
+                    return slices
+
+                magic = struct.unpack(">I", header_bytes)[0]
+                if magic in (FAT_MAGIC, FAT_CIGAM):
+                    endian = ">" if magic == FAT_MAGIC else "<"
+                    f.seek(4)
+                    nfat_arch = struct.unpack(f"{endian}I", f.read(4))[0]
+                    for _ in range(nfat_arch):
+                        cputype, cpusubtype, offset, size, align = struct.unpack(f"{endian}5I", f.read(20))
+                        arch_name = self._cputype_to_str(cputype, cpusubtype)
+                        slices.append((offset, size, arch_name))
+                elif magic in (FAT_MAGIC_64, FAT_CIGAM_64):
+                    endian = ">" if magic == FAT_MAGIC_64 else "<"
+                    f.seek(4)
+                    nfat_arch = struct.unpack(f"{endian}I", f.read(4))[0]
+                    for _ in range(nfat_arch):
+                        cputype, cpusubtype, offset, size, align = struct.unpack(f"{endian}2I2QI", f.read(32))
+                        arch_name = self._cputype_to_str(cputype, cpusubtype)
+                        slices.append((offset, size, arch_name))
+                else:
+                    # 单架构 Mach-O
+                    f.seek(0)
+                    m_hdr = f.read(8)
+                    if len(m_hdr) >= 8:
+                        s_magic = struct.unpack("<I", m_hdr[:4])[0]
+                        s_endian = "<" if s_magic in (MH_MAGIC, MH_MAGIC_64) else ">"
+                        cputype, cpusubtype = struct.unpack(f"{s_endian}2I", m_hdr[4:8])
+                        arch_name = self._cputype_to_str(cputype, cpusubtype)
+                    else:
+                        arch_name = "arm64"
+                    slices.append((0, os.path.getsize(self.file_path), arch_name))
+        except Exception:
+            pass
+
+        return slices
+
+    def _build_xrefs(self, info: TargetBinaryInfo):
+        """
+        建立 ARM64 交叉引用报表（按需延迟）。
+        对大型二进制（>80MB）采用精简模式，只扫描高价值敏感关键词；
+        小型目标则建立全量 xrefs 表。
+        """
+        try:
+            file_size = os.path.getsize(self.file_path)
+            lightweight = file_size > 80 * 1024 * 1024
+
+            scanner = XrefScanner(self.file_path)
+            if lightweight:
+                HIGH_VALUE_KEYWORDS = [
+                    "ptrace", "sysctl", "PT_DENY_ATTACH", "P_TRACED",
+                    "jailbreak", "cydia", "/var/jb", "Cydia",
+                    "frida", "FridaGadget", "gum-js-loop",
+                    "getppid", "fork", "popen", "system", "isatty",
+                    "DYLD_INSERT_LIBRARIES",
+                    "hook", "substrate", "Substitute", "dobby",
+                    "ssl_pinning", "TrustKit", "AFNetworking",
+                ]
+                info.xrefs = scanner.scan_for(HIGH_VALUE_KEYWORDS)
+            else:
+                info.xrefs = scanner.scan()
+        except Exception:
+            pass
+

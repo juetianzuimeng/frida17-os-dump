@@ -123,8 +123,10 @@ class IPAParser:
         return ""
 
     def _parse_info_plist(self, pkg_info: AppPackageInfo):
-        """解析 Info.plist 配置"""
+        """解析 Info.plist 配置 (支持 iOS 与 macOS .app 目录拓扑)"""
         plist_path = os.path.join(pkg_info.app_dir, "Info.plist")
+        if not os.path.exists(plist_path):
+            plist_path = os.path.join(pkg_info.app_dir, "Contents", "Info.plist")
         if not os.path.exists(plist_path):
             return
 
@@ -199,6 +201,11 @@ class IPAParser:
         # 1. 主二进制
         main_exec_name = pkg_info.executable_name or pkg_info.bundle_name
         main_exec_path = os.path.join(pkg_info.app_dir, main_exec_name) if main_exec_name else ""
+        if not os.path.isfile(main_exec_path) and main_exec_name:
+            # 兼容 macOS .app (Contents/MacOS/<exec>)
+            macos_exec = os.path.join(pkg_info.app_dir, "Contents", "MacOS", main_exec_name)
+            if os.path.isfile(macos_exec):
+                main_exec_path = macos_exec
 
         if main_exec_path and os.path.isfile(main_exec_path):
             main_parser = MachOParser(
@@ -208,8 +215,10 @@ class IPAParser:
             )
             pkg_info.main_binary = main_parser.parse()
 
-        # 2. Frameworks 目录
+        # 2. Frameworks 目录 (支持 iOS Frameworks/ 与 macOS Contents/Frameworks/)
         frameworks_dir = os.path.join(pkg_info.app_dir, "Frameworks")
+        if not os.path.isdir(frameworks_dir):
+            frameworks_dir = os.path.join(pkg_info.app_dir, "Contents", "Frameworks")
         if os.path.isdir(frameworks_dir):
             for item in os.listdir(frameworks_dir):
                 item_path = os.path.join(frameworks_dir, item)

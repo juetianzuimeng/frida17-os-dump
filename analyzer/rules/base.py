@@ -5,7 +5,10 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from analyzer.xref_scanner import XrefReport
 
 
 class RuleCategory(Enum):
@@ -32,6 +35,7 @@ class MatchLocation:
     match_type: str           # 命中类型：'symbol', 'import', 'string', 'regex', 'framework', 'config', 'header'
     target: str               # 命中目标具体内容（符号名/字符串/特征）
     context: Optional[str] = None   # 命中上下文或说明
+    xrefs: List[Any] = field(default_factory=list)  # ARM64 交叉引用列表 (XrefResult)
 
 
 @dataclass
@@ -73,3 +77,6 @@ class TargetBinaryInfo:
     dylibs: List[str] = field(default_factory=list)
     strings: Set[str] = field(default_factory=set)
     text_content: str = ""    # 合并后的字符串全文（供正则快速检索）
+    objc_classes: Dict[str, Any] = field(default_factory=dict)       # 解析出的 Objective-C 类字典 (ObjCClass)
+    objc_categories: List[Any] = field(default_factory=list)         # 解析出的 Objective-C 分类列表 (ObjCCategory)
+    xrefs: Optional[Any] = None  # ARM64 交叉引用报表 (XrefReport)，按需延迟填充

@@ -63,6 +63,13 @@ class ConsoleReporter:
         print(f"  • 砸壳状态 (Encryption) : {enc_status}")
 
         print(f"  • 扫描二进制总数       : {result.binaries_scanned_count} (主二进制 + {len(pkg.frameworks)} 个动态库 + {len(pkg.plugins)} 个扩展)")
+        
+        # Objective-C 静态类与分类统计
+        total_objc_classes = (len(pkg.main_binary.objc_classes) if pkg.main_binary else 0) + sum(len(f.objc_classes) for f in pkg.frameworks)
+        total_objc_cats = (len(pkg.main_binary.objc_categories) if pkg.main_binary else 0) + sum(len(f.objc_categories) for f in pkg.frameworks)
+        if total_objc_classes > 0 or total_objc_cats > 0:
+            print(f"  • ObjC 静态结构 (Metadata) : {Color.GREEN}{total_objc_classes} 个类定义{Color.RESET}, {Color.GREEN}{total_objc_cats} 个分类扩展 (Category){Color.RESET}")
+
         if pkg.certificates:
             print(f"  • 内置证书资产         : {len(pkg.certificates)} 个证书文件")
 
@@ -104,7 +111,12 @@ class ConsoleReporter:
             # 打印命中位置
             shown_matches = finding.matches if verbose else finding.matches[:5]
             for m in shown_matches:
-                print(f"    - [{m.match_type.upper()}] {Color.CYAN}{m.binary_name}{Color.RESET} -> {Color.YELLOW}{m.target}{Color.RESET} ({m.context})")
+                xref_hint = ""
+                if m.xrefs:
+                    funcs = [f"func@{x.caller_func_hex}" for x in m.xrefs[:3]]
+                    more = f"等共{len(m.xrefs)}处" if len(m.xrefs) > 3 else ""
+                    xref_hint = f" {Color.GREEN}→ 引用函数: [{', '.join(funcs)}{more}]{Color.RESET}"
+                print(f"    - [{m.match_type.upper()}] {Color.CYAN}{m.binary_name}{Color.RESET} -> {Color.YELLOW}{m.target}{Color.RESET} ({m.context}){xref_hint}")
             if not verbose and finding.match_count > 5:
                 print(f"    - {Color.DIM}... 还有 {finding.match_count - 5} 处命中，使用 --verbose 查看全部{Color.RESET}")
 
@@ -132,6 +144,8 @@ class JSONReporter:
                 "is_encrypted": summary.is_encrypted,
                 "url_schemes": pkg.url_schemes,
                 "binaries_scanned_count": result.binaries_scanned_count,
+                "objc_classes_count": (len(pkg.main_binary.objc_classes) if pkg.main_binary else 0) + sum(len(f.objc_classes) for f in pkg.frameworks),
+                "objc_categories_count": (len(pkg.main_binary.objc_categories) if pkg.main_binary else 0) + sum(len(f.objc_categories) for f in pkg.frameworks),
             },
             "summary": {
                 "defense_score": summary.defense_score,
@@ -166,14 +180,24 @@ class JSONReporter:
                         "binary_path": m.binary_path,
                         "match_type": m.match_type,
                         "target": m.target,
-                        "context": m.context
+                        "context": m.context,
+                        "xrefs": [
+                            {
+                                "caller_va": hex(x.caller_va),
+                                "caller_offset": hex(x.caller_offset),
+                                "caller_func_va": hex(x.caller_func_va),
+                                "caller_func_offset": x.caller_func_hex,
+                                "instr_type": x.instr_type
+                            }
+                            for x in m.xrefs
+                        ]
                     }
                     for m in f.matches
                 ]
             }
             data["findings"].append(f_dict)
 
-        return json.dumps(data, ensure_ascii=False, indent=2)
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
 
 class MarkdownReporter:

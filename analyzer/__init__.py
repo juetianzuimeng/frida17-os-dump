@@ -5,6 +5,10 @@ IPA 静态安全分析与 Tweak 自动化生成工具模块
 
 from .ipa_parser import IPAParser, AppPackageInfo
 from .macho_parser import MachOParser
+from .objc_parser import ObjCParser, ObjCClass, ObjCCategory, ObjCMethod, ObjCMetadata
+from .xref_scanner import XrefScanner, XrefReport, XrefResult
+from .demangler import SwiftDemangler
+from .disassembler import Disassembler, DisasmInstruction, DisasmFunction
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -13,6 +17,18 @@ __all__ = [
     "IPAParser",
     "AppPackageInfo",
     "MachOParser",
+    "ObjCParser",
+    "ObjCClass",
+    "ObjCCategory",
+    "ObjCMethod",
+    "ObjCMetadata",
+    "XrefScanner",
+    "XrefReport",
+    "XrefResult",
+    "SwiftDemangler",
+    "Disassembler",
+    "DisasmInstruction",
+    "DisasmFunction",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",

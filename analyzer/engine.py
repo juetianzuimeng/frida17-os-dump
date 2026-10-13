@@ -125,7 +125,8 @@ class AnalysisEngine:
                             binary_path=b.rel_path,
                             match_type="import",
                             target=imp,
-                            context="动态导入 C 符号/系统 API"
+                            context="动态导入 C 符号/系统 API",
+                            xrefs=b.xrefs.query(imp) if b.xrefs else []
                         )
                     )
 
@@ -138,7 +139,8 @@ class AnalysisEngine:
                             binary_path=b.rel_path,
                             match_type="symbol",
                             target=sym,
-                            context="符号表中存在特征符号"
+                            context="符号表中存在特征符号",
+                            xrefs=b.xrefs.query(sym) if b.xrefs else []
                         )
                     )
 
@@ -151,7 +153,8 @@ class AnalysisEngine:
                             binary_path=b.rel_path,
                             match_type="string",
                             target=st,
-                            context="二进制文本/常量段匹配到特征字符串"
+                            context="二进制文本/常量段匹配到特征字符串",
+                            xrefs=b.xrefs.query(st) if b.xrefs else []
                         )
                     )
 
@@ -168,7 +171,8 @@ class AnalysisEngine:
                                 binary_path=b.rel_path,
                                 match_type="regex",
                                 target=sample_m,
-                                context=f"正则模式 /{reg_pat}/ 匹配成功 ({len(matches)} 次)"
+                                context=f"正则模式 /{reg_pat}/ 匹配成功 ({len(matches)} 次)",
+                                xrefs=b.xrefs.query(sample_m) if b.xrefs else []
                             )
                         )
                 except Exception:
