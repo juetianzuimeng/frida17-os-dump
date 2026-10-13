@@ -21,11 +21,11 @@
   - 导出/检索类与方法定义 (支持 Swift 还原名检索): `python3 analyze.py -f <target.ipa> --dump-objc [Keyword]`
   - ARM64 交叉引用反查 (定位敏感特征引用函数): `python3 analyze.py -f <target.ipa> --xrefs [Keyword]`
   - Headless 精准函数反汇编 (免开 IDA 秒看函数汇编): `python3 analyze.py -f <target.ipa> --disasm <OffsetOrSymbol>`
-  - ARM64 函数调用图追溯 (反查调用者与子调用树): 
-    - 查谁调用了它 (上游调用链): `python3 analyze.py -f <target.ipa> --callers <Offset/Symbol>`
-    - 查它调用了谁 (下游子调用): `python3 analyze.py -f <target.ipa> --callees <Offset/Symbol>`
+  - ARM64 函数调用图与多级拓扑树追溯: 
+    - 查谁调用了它 (上游调用链): `python3 analyze.py -f <target.ipa> --callers <Offset/Symbol> [--depth 2]`
+    - 查它调用了谁 (下游子调用树): `python3 analyze.py -f <target.ipa> --callees <Offset/Symbol> [--depth 2] [--export-mermaid callgraph.md]`
   - 静态一键派生 Frida 动态追踪探针: `python3 analyze.py -f <target.ipa> --gen-trace <Offset1,Offset2> [--trace-output trace.js]`
-  - 独立 Swift 混淆符号还原: `python3 analyze.py --demangle <MangledSymbol>`
+  - 独立 Swift & C++ (Itanium ABI) 符号秒级还原: `python3 analyze.py --demangle <MangledSymbol>`
 - **触发时机**: 
   1. 面对全新 App 的“摸底”阶段：探测应用是否有**反调试 (ptrace/sysctl)**、**越狱检测**、**强 SSL Pinning** 或对 **Frida 的查杀**；静态报告会自动标识特征被哪个函数引用 (`func@0x...`)；
   2. **逆向业务协议或符号被 strip 剥离时**：需要快速掌握 App 内部有哪些 Controller、Manager、Service，或寻找特定业务关键字（如 `Message`、`Session`、`Socket`、`Crypto`）的类名与方法签名时；

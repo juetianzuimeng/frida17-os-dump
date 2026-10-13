@@ -137,6 +137,19 @@ def parse_args():
         help="指定生成的 Frida 探针 JS 脚本保存路径 (未指定则默认在控制台输出)"
     )
     parser.add_argument(
+        "--depth",
+        dest="call_depth",
+        type=int,
+        default=1,
+        help="指定函数调用图追溯的遍历深度 (默认: 1 层，可指定 2, 3 等多层递归展开)"
+    )
+    parser.add_argument(
+        "--export-mermaid",
+        dest="export_mermaid_path",
+        default=None,
+        help="将函数调用拓扑树导出为 Markdown Mermaid 流程图文件 (例如: callgraph.md)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -148,15 +161,19 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 独立 Swift 符号还原工具模式
+    # 独立 Swift / C++ 符号还原工具模式
     if args.demangle_symbol is not None:
-        from analyzer.demangler import SwiftDemangler
+        from analyzer.demangler import UniversalDemangler, SwiftDemangler
+        from analyzer.cpp_demangler import CppDemangler
+
         sym = args.demangle_symbol.strip()
         if not sym:
-            print("[\033[31m!\033[0m] 请输入要还原的 Swift 符号，例如: python3 analyze.py --demangle _TtC10Calculator16CalculatorLayout")
+            print("[\033[31m!\033[0m] 请输入要还原的符号，例如: python3 analyze.py --demangle _TtC10Calculator16CalculatorLayout 或 python3 analyze.py --demangle __ZN11reliability16MmappedFilePosix12openExistingEPKcPS2_Pibb")
             sys.exit(1)
-        dem = SwiftDemangler.demangle(sym)
-        print(f"\n\033[1;32m[+] Swift 符号还原 (Demangled):\033[0m")
+
+        kind = "Swift" if SwiftDemangler.is_swift_symbol(sym) else ("C++ (Itanium)" if CppDemangler.is_cpp_symbol(sym) else "通用")
+        dem = UniversalDemangler.demangle(sym)
+        print(f"\n\033[1;32m[+] 符号反混淆还原 [{kind}] (Demangled):\033[0m")
         print(f"  原始混淆名: \033[90m{sym}\033[0m")
         print(f"  还原可读名: \033[1;36m{dem}\033[0m\n")
         sys.exit(0)
@@ -210,9 +227,9 @@ def main():
 
         # 3.8. 函数调用图分析 (Call Graph: Callers & Callees)
         if args.callers_target:
-            handle_call_graph(pkg_info, mode="callers", target=args.callers_target)
+            handle_call_graph(pkg_info, mode="callers", target=args.callers_target, depth=args.call_depth, export_mermaid=args.export_mermaid_path)
         if args.callees_target:
-            handle_call_graph(pkg_info, mode="callees", target=args.callees_target)
+            handle_call_graph(pkg_info, mode="callees", target=args.callees_target, depth=args.call_depth, export_mermaid=args.export_mermaid_path)
 
         # 3.9. Frida 动态追踪探针一键派生
         if args.gen_trace_targets:
@@ -428,8 +445,8 @@ def handle_disasm(pkg_info, target: str, count: int = 40):
     print("\n" + "=" * 80 + "\n")
 
 
-def handle_call_graph(pkg_info, mode: str, target: str):
-    """分析 ARM64 函数调用图 (Callers 或 Callees)"""
+def handle_call_graph(pkg_info, mode: str, target: str, depth: int = 1, export_mermaid: str = None):
+    """分析 ARM64 函数调用图 (Callers 或 Callees)，支持多级深度展开与 Mermaid 可视化导出"""
     from analyzer.call_graph import CallGraphAnalyzer
     from analyzer.disassembler import Disassembler
 
@@ -437,10 +454,12 @@ def handle_call_graph(pkg_info, mode: str, target: str):
     mode_name = "上游调用者 (Callers)" if mode == "callers" else "下游子调用 (Callees)"
 
     print("\n" + "=" * 80)
-    print(f"\033[1;34m[+] ARM64 函数调用图分析 ({mode_name}) — 目标: '{target}'\033[0m")
+    print(f"\033[1;34m[+] ARM64 函数调用图分析 ({mode_name}) — 目标: '{target}' (遍历深度: {depth} 层)\033[0m")
     print("=" * 80)
 
     total_edges = 0
+    mermaid_charts = []
+
     for bin_info in targets:
         if not bin_info:
             continue
@@ -453,39 +472,66 @@ def handle_call_graph(pkg_info, mode: str, target: str):
             continue
 
         for label, va in resolved_list[:5]:
-            if mode == "callers":
-                edges = cg.get_callers(va)
-                if not edges:
+            if depth > 1:
+                # 多级深度树状展示
+                tree = cg.build_call_tree(va, mode=mode, max_depth=depth)
+                if not tree.children:
                     continue
-                print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数: func@0x{va:X} ({label})\033[0m  \033[90m(发现 {len(edges)} 处调用来源)\033[0m")
-                for i, edge in enumerate(edges[:30], 1):
-                    delta = edge.call_site_va - edge.caller_va
-                    delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
-                    print(
-                        f"      \033[96m[{i:02d}] func@0x{edge.caller_va:X}\033[0m"
-                        f"  \033[90m(指令地址: 0x{edge.call_site_va:X}, 偏移动态: {delta_str})\033[0m"
-                        f"  \033[1;33mBL -> 0x{edge.target_va:X}\033[0m"
-                    )
-                if len(edges) > 30:
-                    print(f"      \033[90m... 还有 {len(edges) - 30} 处调用来源未列出\033[0m")
-                total_edges += len(edges)
+                print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 多级调用拓扑树 (Depth: {depth}):\033[0m")
+                for line in CallGraphAnalyzer.format_console_tree(tree):
+                    print(f"    {line}")
+                total_edges += len(tree.children)
+
+                if export_mermaid:
+                    chart = CallGraphAnalyzer.format_mermaid(tree, mode=mode, title=f"{bin_info.name} - {label} ({mode})")
+                    mermaid_charts.append(chart)
             else:
-                edges = cg.get_callees(va, from_exact_addr=True)
-                if not edges:
-                    edges = cg.get_callees(va, from_exact_addr=False)
-                if not edges:
-                    continue
-                print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数/位置: 0x{va:X} ({label})\033[0m  \033[90m(探测到 {len(edges)} 处子调用)\033[0m")
-                for i, edge in enumerate(edges[:30], 1):
-                    delta = edge.call_site_va - edge.caller_va
-                    delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
-                    print(
-                        f"      \033[96m[{i:02d}] 指令 0x{edge.call_site_va:X} ({delta_str})\033[0m"
-                        f"  \033[1;33mBL -> func@0x{edge.target_va:X}\033[0m"
-                    )
-                if len(edges) > 30:
-                    print(f"      \033[90m... 还有 {len(edges) - 30} 处子调用未列出\033[0m")
-                total_edges += len(edges)
+                # 单级平铺展示
+                if mode == "callers":
+                    edges = cg.get_callers(va)
+                    if not edges:
+                        continue
+                    print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数: func@0x{va:X} ({label})\033[0m  \033[90m(发现 {len(edges)} 处调用来源)\033[0m")
+                    for i, edge in enumerate(edges[:30], 1):
+                        delta = edge.call_site_va - edge.caller_va
+                        delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
+                        print(
+                            f"      \033[96m[{i:02d}] func@0x{edge.caller_va:X}\033[0m"
+                            f"  \033[90m(指令地址: 0x{edge.call_site_va:X}, 偏移动态: {delta_str})\033[0m"
+                            f"  \033[1;33mBL -> 0x{edge.target_va:X}\033[0m"
+                        )
+                    if len(edges) > 30:
+                        print(f"      \033[90m... 还有 {len(edges) - 30} 处调用来源未列出\033[0m")
+                    total_edges += len(edges)
+                else:
+                    edges = cg.get_callees(va, from_exact_addr=True)
+                    if not edges:
+                        edges = cg.get_callees(va, from_exact_addr=False)
+                    if not edges:
+                        continue
+                    print(f"\n\033[93m  [{bin_info.name}]\033[0m \033[1;32m→ 目标函数/位置: 0x{va:X} ({label})\033[0m  \033[90m(探测到 {len(edges)} 处子调用)\033[0m")
+                    for i, edge in enumerate(edges[:30], 1):
+                        delta = edge.call_site_va - edge.caller_va
+                        delta_str = f"+0x{delta:X}" if delta >= 0 else f"-0x{-delta:X}"
+                        print(
+                            f"      \033[96m[{i:02d}] 指令 0x{edge.call_site_va:X} ({delta_str})\033[0m"
+                            f"  \033[1;33mBL -> func@0x{edge.target_va:X}\033[0m"
+                        )
+                    if len(edges) > 30:
+                        print(f"      \033[90m... 还有 {len(edges) - 30} 处子调用未列出\033[0m")
+                    total_edges += len(edges)
+
+                if export_mermaid:
+                    tree = cg.build_call_tree(va, mode=mode, max_depth=1)
+                    chart = CallGraphAnalyzer.format_mermaid(tree, mode=mode, title=f"{bin_info.name} - {label} ({mode})")
+                    mermaid_charts.append(chart)
+
+    if export_mermaid and mermaid_charts:
+        out_p = os.path.abspath(export_mermaid)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        with open(out_p, "w", encoding="utf-8") as f:
+            f.write("# 函数调用拓扑 Mermaid 流程图\n\n" + "\n\n".join(mermaid_charts))
+        print(f"\n\033[1;32m[+] 调用拓扑 Mermaid 流程图已成功保存至: {out_p}\033[0m")
 
     if total_edges == 0:
         print(f"\033[90m  未在二进制中检测到与 '{target}' 相关的有效调用边。\033[0m")

@@ -228,3 +228,56 @@ class SwiftDemangler:
             return prefix + ".".join(parts)
 
         return None
+
+
+class UniversalDemangler:
+    """全能符号反混淆器：统一处理 Swift 与 C++ (Itanium ABI) 混淆符号"""
+
+    @classmethod
+    def demangle(cls, symbol: str) -> str:
+        """根据前缀特征自动识别并还原 Swift 或 C++ 符号"""
+        if not symbol:
+            return symbol
+        s = symbol.strip()
+
+        # 1. 尝试 Swift
+        if SwiftDemangler.is_swift_symbol(s):
+            dem = SwiftDemangler.demangle(s)
+            if dem != s:
+                return dem
+
+        # 2. 尝试 C++ (Itanium ABI)
+        from .cpp_demangler import CppDemangler
+        if CppDemangler.is_cpp_symbol(s):
+            dem = CppDemangler.demangle(s)
+            if dem != s:
+                return dem
+
+        return symbol
+
+    @classmethod
+    def demangle_batch(cls, symbols: List[str]) -> Dict[str, str]:
+        """批量混合还原"""
+        from .cpp_demangler import CppDemangler
+
+        swift_syms = []
+        cpp_syms = []
+        others = {}
+
+        for sym in symbols:
+            if SwiftDemangler.is_swift_symbol(sym):
+                swift_syms.append(sym)
+            elif CppDemangler.is_cpp_symbol(sym):
+                cpp_syms.append(sym)
+            else:
+                others[sym] = sym
+
+        swift_res = SwiftDemangler.demangle_batch(swift_syms) if swift_syms else {}
+        cpp_res = CppDemangler.demangle_batch(cpp_syms) if cpp_syms else {}
+
+        res = {}
+        res.update(others)
+        res.update(swift_res)
+        res.update(cpp_res)
+        return res
+

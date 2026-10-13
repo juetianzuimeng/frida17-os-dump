@@ -7,7 +7,8 @@ from .ipa_parser import IPAParser, AppPackageInfo
 from .macho_parser import MachOParser
 from .objc_parser import ObjCParser, ObjCClass, ObjCCategory, ObjCMethod, ObjCMetadata
 from .xref_scanner import XrefScanner, XrefReport, XrefResult
-from .demangler import SwiftDemangler
+from .demangler import SwiftDemangler, UniversalDemangler
+from .cpp_demangler import CppDemangler
 from .disassembler import Disassembler, DisasmInstruction, DisasmFunction
 from .call_graph import CallGraphAnalyzer, CallEdge, CallGraphReport
 from .tracer_generator import TracerGenerator
@@ -28,6 +29,8 @@ __all__ = [
     "XrefReport",
     "XrefResult",
     "SwiftDemangler",
+    "CppDemangler",
+    "UniversalDemangler",
     "Disassembler",
     "DisasmInstruction",
     "DisasmFunction",

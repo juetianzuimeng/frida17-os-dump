@@ -85,16 +85,17 @@ python3 analyze.py -f Messenger.ipa --dump-objc Message
 # 6. ARM64 交叉引用反查 (快速定位引用特定敏感特征/API 的函数偏移 Offset)
 python3 analyze.py -f Messenger.ipa --xrefs ptrace
 
-# 7. 独立 Swift 混淆符号秒级还原 (支持 _TtC... 类名与 $s 复杂符号)
+# 7. 独立 Swift & C++ (Itanium ABI) 符号秒级还原 (自动识别 _TtC... 类名、$s 与 __ZN... 符号)
 python3 analyze.py --demangle _TtC10Calculator16CalculatorLayout
+python3 analyze.py --demangle __ZN11reliability16MmappedFilePosix12openExistingEPKcPS2_Pibb
 
 # 8. Headless 精准函数反汇编 (免开 IDA 秒看 ARM64 汇编实现，支持带内联字符串与系统调用注释)
 python3 analyze.py -f Messenger.ipa --disasm 0x1E9B34
 python3 analyze.py -f Messenger.ipa --disasm ptrace
 
-# 9. ARM64 函数调用图追溯 (Callers 上游调用者反查 / Callees 下游子调用依赖树)
+# 9. ARM64 函数调用图追溯与多级拓扑树 (支持 --depth 递归深搜与 Mermaid 流程图导出)
 python3 analyze.py -f Messenger.ipa --callers 0x47A68
-python3 analyze.py -f Messenger.ipa --callees 0x746D90
+python3 analyze.py -f Messenger.ipa --callees 0x746D90 --depth 2 --export-mermaid ./callgraph.md
 
 # 10. 静态分析一键派生 Frida 动态追踪探针脚本 (自动生成带入参探测、准确调用栈与耗时统计的 JS 探针)
 python3 analyze.py -f Messenger.ipa --gen-trace 0x746D90,0x47A68 --trace-output ./trace_demo.js
