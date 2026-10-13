@@ -72,6 +72,19 @@ class IPAParser:
                     app_dir = self._find_app_in_payload(payload_dir)
                 else:
                     app_dir = self.target_path
+        elif not zipfile.is_zipfile(self.target_path):
+            # 直接传入了单文件 Mach-O 二进制 (dylib / framework binary / executable)
+            bin_name = os.path.basename(self.target_path)
+            parser = MachOParser(self.target_path)
+            bin_info = parser.parse()
+            pkg_info = AppPackageInfo(
+                ipa_path=self.target_path,
+                app_dir=os.path.dirname(self.target_path),
+                bundle_name=bin_name,
+                executable_name=bin_name,
+                main_binary=bin_info
+            )
+            return pkg_info
         else:
             # 传入了 .ipa 文件，解压到临时目录
             self.temp_dir = tempfile.mkdtemp(prefix="ipa_analyze_")
