@@ -221,6 +221,18 @@ def parse_args():
         help="将提取的结构化字符串导出为 JSON 或 Markdown 文件路径"
     )
     parser.add_argument(
+        "--dump-entitlements",
+        dest="dump_entitlements",
+        action="store_true",
+        help="从 Mach-O LC_CODE_SIGNATURE 静态提取沙盒特权、Keychain 组与 App Groups 声明"
+    )
+    parser.add_argument(
+        "--entitlements-output",
+        dest="entitlements_output_file",
+        default=None,
+        help="将提取的沙盒特权导出为文件 (.plist / .xml / .json)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -329,6 +341,10 @@ def main():
                 min_len=args.min_string_len,
                 output_file=args.strings_output_file
             )
+
+        # 3.14. 原生沙盒特权 (Entitlements) 静态提取 (REA BinaryMetadataProvider)
+        if args.dump_entitlements:
+            handle_dump_entitlements(pkg_info, args.entitlements_output_file)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -968,6 +984,86 @@ def handle_dump_strings(
         print(f"\n  \033[1;32m[✓] 完整字符串报表已成功导出至: {out_p}\033[0m\n")
 
 
+def handle_dump_entitlements(pkg_info, output_file: Optional[str] = None):
+    """处理 Mach-O 原生沙盒特权 (Entitlements) 提取"""
+    import json
+    from analyzer.entitlements_extractor import EntitlementsExtractor
+
+    target_bin = pkg_info.main_binary.abs_path if pkg_info.main_binary else pkg_info.app_path
+    extractor = EntitlementsExtractor(target_bin)
+    summary = extractor.extract()
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;35m[+] 原生沙盒特权与签名声明提取 (Mach-O Entitlements Extractor)\033[0m")
+    print(f"  目标二进制: \033[93m{os.path.basename(target_bin)}\033[0m")
+    print("=" * 80)
+
+    if not summary:
+        print(f"\n  \033[91m[-] 未在目标二进制中检索到有效的 LC_CODE_SIGNATURE / Entitlements SuperBlob\033[0m\n")
+        return
+
+    print(f"\n  \033[1;32m[✓] 成功解析沙盒特权清单 (Entitlements Plist):\033[0m")
+    print(f"    • \033[96mApplication ID\033[0m         : \033[1m{summary.app_id or '无'}\033[0m")
+    print(f"    • \033[96mTeam ID\033[0m                : \033[1m{summary.team_id or '无'}\033[0m")
+    print(f"    • \033[96mAPS Environment\033[0m        : \033[1m{summary.aps_environment or '无'}\033[0m")
+
+    if summary.keychain_access_groups:
+        print(f"    • \033[93mKeychain Access Groups\033[0m : ({len(summary.keychain_access_groups)} 个共享组)")
+        for kg in summary.keychain_access_groups:
+            print(f"        \033[92m- {kg}\033[0m")
+    else:
+        print(f"    • \033[90mKeychain Access Groups : 无\033[0m")
+
+    if summary.application_groups:
+        print(f"    • \033[93mApplication Groups\033[0m     : ({len(summary.application_groups)} 个共享沙盒容器)")
+        for ag in summary.application_groups:
+            print(f"        \033[92m- {ag}\033[0m")
+    else:
+        print(f"    • \033[90mApplication Groups     : 无\033[0m")
+
+    if summary.icloud_containers:
+        print(f"    • \033[93miCloud Containers\033[0m      : ({len(summary.icloud_containers)} 个云备份容器)")
+        for ic in summary.icloud_containers:
+            print(f"        \033[92m- {ic}\033[0m")
+
+    if summary.associated_domains:
+        print(f"    • \033[93mAssociated Domains\033[0m     : ({len(summary.associated_domains)} 个关联域名)")
+        for ad in summary.associated_domains[:10]:
+            print(f"        \033[90m- {ad}\033[0m")
+        if len(summary.associated_domains) > 10:
+            print(f"        \033[90m... 其余 {len(summary.associated_domains) - 10} 项省略 ...\033[0m")
+
+    if summary.other_entitlements:
+        print(f"\n    • \033[94m其他声明特权项\033[0m ({len(summary.other_entitlements)} 项):")
+        for k, v in list(summary.other_entitlements.items())[:15]:
+            print(f"        \033[90m- {k}\033[0m: \033[1m{v}\033[0m")
+        if len(summary.other_entitlements) > 15:
+            print(f"        \033[90m... 其余 {len(summary.other_entitlements) - 15} 项省略 ...\033[0m")
+
+    # 导出文件
+    if output_file:
+        out_p = os.path.abspath(output_file)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        if out_p.lower().endswith(".json"):
+            export_data = {
+                "application_identifier": summary.app_id,
+                "team_identifier": summary.team_id,
+                "aps_environment": summary.aps_environment,
+                "keychain_access_groups": summary.keychain_access_groups,
+                "application_groups": summary.application_groups,
+                "icloud_containers": summary.icloud_containers,
+                "associated_domains": summary.associated_domains,
+                "other_entitlements": summary.other_entitlements
+            }
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+        else:
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(summary.raw_xml)
+        print(f"\n  \033[1;32m[✓] 沙盒特权原件已成功导出至: {out_p}\033[0m\n")
+
+
 if __name__ == "__main__":
     main()
+
 

@@ -116,6 +116,10 @@ python3 analyze.py -f Messenger.ipa --patch "0x746D90:NOP,0x47A68:RET_TRUE" --pa
 python3 analyze.py -f Messenger.ipa --dump-strings
 python3 analyze.py -f Messenger.ipa --dump-strings task --string-type cfstring --strings-output ./task_strings.json
 
+# 15. 原生沙盒特权与签名声明静态提取 (纯 Python 解析 LC_CODE_SIGNATURE，秒获 Keychain 组与 AppGroup 容器)
+python3 analyze.py -f Messenger.ipa --dump-entitlements
+python3 analyze.py -f Messenger.ipa --dump-entitlements --entitlements-output ./entitlements.plist
+
 ```
 
 #### 覆盖的检测维度：
@@ -217,6 +221,7 @@ frida-ios-dump/
 │   ├── cfg_analyzer.py         # [阶段二] 控制流图基本块切分与 Mermaid 可视化
 │   ├── patcher.py              # [阶段三] 指令热修补与 Frida 运行时 Patch 派生器
 │   ├── string_extractor.py     # 结构化 CFString 与宽字符 UString 常量字典提取器
+│   ├── entitlements_extractor.py # 原生沙盒特权 (Entitlements) 与签名元数据提取器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器

@@ -38,6 +38,9 @@
   - 结构化字符串与 CoreFoundation 常量提取 (突破盲猜关键词):
     - 提取并检索常量字典: `python3 analyze.py -f <target.ipa> --dump-strings [Keyword] [--string-type cfstring|ustring|cstring]`
     - 导出全量常量表: `python3 analyze.py -f <target.ipa> --dump-strings --strings-output strings.json`
+  - 原生沙盒特权 (Entitlements) 提取 (离线获取 Keychain 组与 AppGroup 容器):
+    - 终端打印特权报表: `python3 analyze.py -f <target.ipa> --dump-entitlements`
+    - 导出 plist/json 文件: `python3 analyze.py -f <target.ipa> --dump-entitlements --entitlements-output entitlements.plist`
 - **触发时机**: 
   1. 面对全新 App 的“摸底”阶段：探测应用是否有**反调试 (ptrace/sysctl)**、**越狱检测**、**强 SSL Pinning** 或对 **Frida 的查杀**；静态报告会自动标识特征被哪个函数引用 (`func@0x...`)；
   2. **逆向业务协议或符号被 strip 剥离时**：需要快速掌握 App 内部有哪些 Controller、Manager、Service，或寻找特定业务关键字（如 `Message`、`Session`、`Socket`、`Crypto`）的类名与方法签名时；
@@ -48,9 +51,11 @@
   7. **面对跨版本发版导致硬编码偏移失效时**：通过 `--gen-sig` 提取核心函数指令序列并自动遮罩动态操作数，再通过 `--find-sig` 在新版 IPA 中秒级自动对齐新偏移，实现 Hook 脚本与逆向成果的零成本迁移；
   8. **分析复杂状态机、分支跳转与多返回路径函数时**：通过 `--cfg` 自动切分汇编基本块并导出 Mermaid 控制流图，一眼洞悉循环结构、跳出条件与异常分支；
   9. **需强行绕过特定条件判断、反调试或强行置位时**：通过 `--patch <Target>:NOP/RET_TRUE` 静态生成修补后的二进制，或一键导出 Frida 内存热修补脚本（动态 `Memory.protect` 修改执行权限并写入机器码），无需重新打包安装即可立即测试；
-  10. **面对未知或去符号大模块摸底时**：通过 `--dump-strings [keyword]` 提取全量结构化 CFString 与宽字符 UString，快速获取协议任务名、配置项或路由常量，拿其 VA 作为线索输入 `--xrefs` 形成闭环。
+  10. **面对未知或去符号大模块摸底时**：通过 `--dump-strings [keyword]` 提取全量结构化 CFString 与宽字符 UString，快速获取协议任务名、配置项或路由常量，拿其 VA 作为线索输入 `--xrefs` 形成闭环；
+  11. **需定位真机 Keychain 共享组或 AppGroup 沙盒数据库路径时**：通过 `--dump-entitlements` 离线秒级提取 Mach-O 中的特权清单，无需开机即可明确 `keychain-access-groups` 与 `application-groups`。
 - **AI 行动指南**: 
   - 给它喂入砸壳后的 IPA，工具会自动解析 `__objc_classlist`、`__objc_catlist` 并建立 ARM64 指令 xrefs；
+  - 若需要提取应用沙盒权限与 Keychain 访问组，运行 `python3 analyze.py -f <target.ipa> --dump-entitlements`；
   - 若需要摸底常量字典与协议配置线索，运行 `python3 analyze.py -f <target.ipa> --dump-strings [Keyword]` 提取结构化常量；
   - 若需要定位特定业务类，运行 `python3 analyze.py -f <target.ipa> --dump-objc <Keyword>` 快速打印 `@interface` 结构（含 Swift 还原标签）；
   - 若需要定位反调试/防护逻辑执行体，运行 `python3 analyze.py -f <target.ipa> --xrefs <keyword>` 提取调用者函数 Offset；

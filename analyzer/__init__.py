@@ -16,6 +16,7 @@ from .sig_maker import SigMaker, SigMatchResult
 from .cfg_analyzer import CFGAnalyzer, ControlFlowGraph, BasicBlock
 from .patcher import BinaryPatcher, PatchItem
 from .string_extractor import StringExtractor, StringItem
+from .entitlements_extractor import EntitlementsExtractor, EntitlementsSummary
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -51,6 +52,8 @@ __all__ = [
     "PatchItem",
     "StringExtractor",
     "StringItem",
+    "EntitlementsExtractor",
+    "EntitlementsSummary",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",
