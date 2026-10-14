@@ -245,6 +245,25 @@ def parse_args():
         help="将依赖拓扑与导入符号报表导出为文件 (.json / .md)"
     )
     parser.add_argument(
+        "--entropy",
+        dest="scan_entropy",
+        action="store_true",
+        help="执行二进制滑动窗口香农熵 (Entropy) 扫描，定位白盒加密、混淆与密文块"
+    )
+    parser.add_argument(
+        "--entropy-threshold",
+        dest="entropy_threshold",
+        type=float,
+        default=7.2,
+        help="香农熵异常判定阈值 (默认 7.2，正常代码为 5.8-6.4，密文/混淆块 >= 7.2)"
+    )
+    parser.add_argument(
+        "--entropy-output",
+        dest="entropy_output_file",
+        default=None,
+        help="将熵值扫描报表导出为文件 (.json / .md)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -361,6 +380,10 @@ def main():
         # 3.15. 动态库依赖拓扑与导入符号审计 (REA ApplicationGraphProjector)
         if args.dump_deps:
             handle_dump_deps(pkg_info, args.deps_output_file)
+
+        # 3.16. 滑动窗口香农熵 (Entropy) 混淆与加密扫描 (REA BinaryEntropyProfiler)
+        if args.scan_entropy:
+            handle_entropy(pkg_info, threshold=args.entropy_threshold, output_file=args.entropy_output_file)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -1170,8 +1193,102 @@ def handle_dump_deps(pkg_info, output_file: Optional[str] = None):
         print(f"\n  \033[1;32m[✓] 完整依赖拓扑与导入符号报表已成功导出至: {out_p}\033[0m\n")
 
 
+def handle_entropy(pkg_info, threshold: float = 7.2, output_file: Optional[str] = None):
+    """处理滑动窗口香农熵 (Entropy) 扫描与加密/混淆块探测"""
+    import json
+    from analyzer.entropy_scanner import EntropyScanner
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    app_title = pkg_info.display_name or pkg_info.bundle_name or pkg_info.executable_name or os.path.basename(pkg_info.ipa_path)
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;31m[+] 二进制滑动窗口香农熵 (Shannon Entropy) 分析与混淆探测\033[0m")
+    print(f"  目标应用: \033[93m{app_title}\033[0m | 判定阈值: \033[93m{threshold}\033[0m (正常代码: 5.8-6.4, 高熵密文: >= {threshold})")
+    print("=" * 80)
+
+    all_reports = []
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        scanner = EntropyScanner(bin_info.abs_path)
+        report = scanner.scan(threshold=threshold)
+        if not report:
+            continue
+
+        print(f"\n  \033[1;33m[{report.binary_name}]\033[0m 全局平均信息熵: \033[1;36m{report.overall_entropy:.3f} / 8.000\033[0m")
+
+        # 1. 各节平均熵值
+        print(f"    • \033[96m各段/节 (Sections) 熵值画像\033[0m ({len(report.sections)} 个节):")
+        for s in report.sections[:8]:
+            color = "\033[91m" if s.entropy >= 7.2 else ("\033[92m" if s.entropy >= 5.5 else "\033[90m")
+            print(f"        {color}[{s.entropy:.3f}]\033[0m \033[1m{s.name:<25}\033[0m \033[90m(大小: {s.size // 1024:>5} KB)\033[0m -> {s.data_type_hint}")
+        if len(report.sections) > 8:
+            print(f"        \033[90m... 其余 {len(report.sections) - 8} 个节已折叠 ...\033[0m")
+
+        # 2. 异常高熵块
+        if report.spikes:
+            print(f"\n    • \033[1;31m锁定 {len(report.spikes)} 处异常高熵区间 (疑似白盒加密密钥表 / 压缩密文 / 强混淆代码):\033[0m")
+            for i, sp in enumerate(report.spikes[:15], 1):
+                print(
+                    f"        \033[90m[{i:02d}]\033[0m \033[96mVA: {sp.va_hex}\033[0m "
+                    f"\033[90m(偏移: {sp.offset_hex}, 大小: {sp.size // 1024:>3} KB)\033[0m "
+                    f"\033[1;31mMax: {sp.max_entropy:.3f}\033[0m "
+                    f"\033[93m[{sp.section_name}]\033[0m -> "
+                    f"\033[1;35m{sp.assessment}\033[0m"
+                )
+            if len(report.spikes) > 15:
+                print(f"        \033[90m... 其余 {len(report.spikes) - 15} 处高熵块已省略 (可使用 --entropy-output 导出全量数据) ...\033[0m")
+        else:
+            print(f"\n    • \033[92m未检测到高于 {threshold} 的异常高熵密集数据块 (代码分布平缓无明显外挂加壳密文)\033[0m")
+
+        all_reports.append({
+            "binary": report.binary_name,
+            "overall_entropy": report.overall_entropy,
+            "sections": [
+                {"name": s.name, "va": hex(s.va), "size": s.size, "entropy": s.entropy, "hint": s.data_type_hint}
+                for s in report.sections
+            ],
+            "spikes": [
+                {
+                    "offset": sp.offset_hex,
+                    "va": sp.va_hex,
+                    "size_bytes": sp.size,
+                    "max_entropy": sp.max_entropy,
+                    "mean_entropy": sp.mean_entropy,
+                    "section": sp.section_name,
+                    "assessment": sp.assessment
+                }
+                for sp in report.spikes
+            ]
+        })
+
+    # 导出文件
+    if output_file and all_reports:
+        out_p = os.path.abspath(output_file)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        if out_p.lower().endswith(".json"):
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(all_reports, f, ensure_ascii=False, indent=2)
+        else:
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(f"# 二进制香农熵 (Entropy) 与混淆/密钥区扫描报表\n\n")
+                f.write(f"- 目标应用: `{app_title}`\n")
+                f.write(f"- 扫描判定阈值: `{threshold}`\n\n")
+                for r in all_reports:
+                    f.write(f"## 模块: `{r['binary']}` (全局平均熵: {r['overall_entropy']:.3f})\n\n")
+                    f.write(f"### 异常高熵区间 ({len(r['spikes'])} 处)\n\n")
+                    f.write("| 序号 | 虚拟地址 (VA) | 物理偏移 | 大小 (KB) | 最大熵 | 所属节 | 风险研判 |\n")
+                    f.write("| :---: | :--- | :--- | :---: | :---: | :--- | :--- |\n")
+                    for idx, sp in enumerate(r["spikes"], 1):
+                        f.write(f"| {idx} | `{sp['va']}` | `{sp['offset']}` | {sp['size_bytes'] // 1024} | {sp['max_entropy']:.3f} | `{sp['section']}` | {sp['assessment']} |\n")
+                    f.write("\n")
+        print(f"\n  \033[1;32m[✓] 完整香农熵全景报表已成功导出至: {out_p}\033[0m\n")
+
+
 if __name__ == "__main__":
     main()
+
 
 
 

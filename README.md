@@ -124,6 +124,10 @@ python3 analyze.py -f Messenger.ipa --dump-entitlements --entitlements-output ./
 python3 analyze.py -f Messenger.ipa --dump-deps
 python3 analyze.py -f Messenger.ipa --dump-deps --deps-output ./deps_report.md
 
+# 17. 滑动窗口香农熵 (Entropy) 分析与混淆探测 (纯数学模型识别高密度密文、白盒密钥表与 OLLVM 混淆块)
+python3 analyze.py -f Messenger.ipa --entropy
+python3 analyze.py -f Messenger.ipa --entropy --entropy-threshold 7.2 --entropy-output ./entropy_report.md
+
 ```
 
 #### 覆盖的检测维度：
@@ -227,6 +231,7 @@ frida-ios-dump/
 │   ├── string_extractor.py     # 结构化 CFString 与宽字符 UString 常量字典提取器
 │   ├── entitlements_extractor.py # 原生沙盒特权 (Entitlements) 与签名元数据提取器
 │   ├── dependency_auditor.py   # 动态链接库依赖拓扑树与导入符号审计器
+│   ├── entropy_scanner.py      # 二进制香农熵 (Entropy) 与混淆/密钥区探测器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器
