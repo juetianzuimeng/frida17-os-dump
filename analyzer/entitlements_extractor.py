@@ -135,7 +135,7 @@ class EntitlementsExtractor:
         if is_64:
             _, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from(f"{endian}7I", data, slice_offset + 4)
         else:
-            _, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from(f"{endian}6I", data, slice_offset + 4)
+            _, _, _, ncmds, sizeofcmds, _ = struct.unpack_from(f"{endian}6I", data, slice_offset + 4)
 
         cmd_pos = slice_offset + hdr_size
         cs_off, cs_sz = None, None

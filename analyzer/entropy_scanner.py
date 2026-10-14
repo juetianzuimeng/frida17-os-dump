@@ -162,7 +162,7 @@ class EntropyScanner:
         if is_64:
             _, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from(f"{endian}7I", data, so + 4)
         else:
-            _, _, _, ncmds, sizeofcmds, _, _ = struct.unpack_from(f"{endian}6I", data, so + 4)
+            _, _, _, ncmds, sizeofcmds, _ = struct.unpack_from(f"{endian}6I", data, so + 4)
 
         cmd_pos = so + hdr_size
         LC_SEGMENT_64 = 0x19
