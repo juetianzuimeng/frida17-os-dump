@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 import time
+from typing import Dict, List, Optional, Tuple
 
 # 将当前目录加入模块搜索路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -192,6 +193,34 @@ def parse_args():
         help="导出免修改原文件的 Frida 运行时内存热补丁 JS 脚本路径 (如: mem_patch.js)"
     )
     parser.add_argument(
+        "--dump-strings",
+        dest="dump_strings_kw",
+        nargs="?",
+        const="",
+        default=None,
+        help="提取结构化 CFString、宽字符 UString 与 CString 常量字典 (可选附带关键词，如: --dump-strings 或 --dump-strings task)"
+    )
+    parser.add_argument(
+        "--string-type",
+        dest="string_type",
+        default="all",
+        choices=["all", "cfstring", "ustring", "cstring"],
+        help="指定提取的字符串类型 (all, cfstring, ustring, cstring，默认为 all)"
+    )
+    parser.add_argument(
+        "--min-len",
+        dest="min_string_len",
+        type=int,
+        default=3,
+        help="过滤提取字符串的最小长度 (默认为 3)"
+    )
+    parser.add_argument(
+        "--strings-output",
+        dest="strings_output_file",
+        default=None,
+        help="将提取的结构化字符串导出为 JSON 或 Markdown 文件路径"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -290,6 +319,16 @@ def main():
         # 3.12. 指令静态热修补与 Frida 内存 Patch 派生
         if args.patch_specs:
             handle_patch(pkg_info, args.patch_specs, args.patch_output_file, args.patch_script_file)
+
+        # 3.13. 结构化字符串与 CFString 常量提取 (REA StringTableInspector)
+        if args.dump_strings_kw is not None:
+            handle_dump_strings(
+                pkg_info,
+                keyword=args.dump_strings_kw,
+                string_type=args.string_type,
+                min_len=args.min_string_len,
+                output_file=args.strings_output_file
+            )
 
         # 4. 导出文件报告
         if args.output_file:
@@ -849,5 +888,86 @@ def handle_patch(pkg_info, patch_specs: str, patch_output: str = None, patch_scr
             print(f"      \033[93m建议启动命令:\033[0m \033[1mfrida -U -f {bundle_id} -l {patch_script} --no-pause\033[0m\n")
 
 
+def handle_dump_strings(
+    pkg_info,
+    keyword: Optional[str] = None,
+    string_type: str = "all",
+    min_len: int = 3,
+    output_file: Optional[str] = None
+):
+    """处理结构化字符串与 CoreFoundation 常量提取"""
+    import json
+    from analyzer.string_extractor import StringExtractor
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    kw_desc = f" (过滤关键词: '{keyword}')" if keyword else " (全量提取)"
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;36m[+] 结构化字符串与常量字典提取 (Structured String Extractor){kw_desc}\033[0m")
+    print(f"  提取类型: \033[93m{string_type}\033[0m | 最小长度: \033[93m{min_len}\033[0m")
+    print("=" * 80)
+
+    total_extracted_all = []
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        extractor = StringExtractor(bin_info.abs_path)
+        items = extractor.extract_all(min_len=min_len, keyword=keyword or None, string_type=string_type)
+
+        print(f"\n  \033[93m[{bin_info.name}]\033[0m 共解析出 \033[1;32m{len(items)}\033[0m 个符合条件的常量项:")
+
+        # 打印展示前 50 条
+        display_limit = 50
+        for i, item in enumerate(items[:display_limit], 1):
+            val_clean = item.value.replace("\n", "\\n").replace("\r", "\\r")
+            if len(val_clean) > 80:
+                val_clean = val_clean[:77] + "..."
+            type_color = "\033[92m" if item.str_type == "CFString" else ("\033[95m" if item.str_type == "UString" else "\033[94m")
+            print(
+                f"    \033[90m[{i:03d}]\033[0m \033[96mVA: {item.va_hex}\033[0m "
+                f"\033[90m(Off: {item.offset_hex})\033[0m "
+                f"{type_color}[{item.str_type:<8}]\033[0m "
+                f"\033[33m(len={item.length:<2})\033[0m -> "
+                f"\033[1m\"{val_clean}\"\033[0m"
+            )
+
+        if len(items) > display_limit:
+            print(f"    \033[90m... 其余 {len(items) - display_limit} 项已省略 (可使用 --strings-output 导出全量数据) ...\033[0m")
+
+        total_extracted_all.extend([
+            {
+                "binary": bin_info.name,
+                "va": item.va_hex,
+                "offset": item.offset_hex,
+                "type": item.str_type,
+                "length": item.length,
+                "section": item.section,
+                "value": item.value
+            }
+            for item in items
+        ])
+
+    # 导出文件
+    if output_file and total_extracted_all:
+        out_p = os.path.abspath(output_file)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        if out_p.lower().endswith(".json"):
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(total_extracted_all, f, ensure_ascii=False, indent=2)
+        else:
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(f"# 结构化字符串与常量导出报表\n\n")
+                f.write(f"- 目标文件: `{pkg_info.name}`\n")
+                f.write(f"- 匹配项总数: {len(total_extracted_all)}\n\n")
+                f.write("| 序号 | 模块 | 虚拟地址 (VA) | 物理偏移 | 类型 | 长度 | 常量内容 |\n")
+                f.write("| :---: | :--- | :--- | :--- | :--- | :---: | :--- |\n")
+                for idx, row in enumerate(total_extracted_all, 1):
+                    v_esc = row["value"].replace("|", "\\|").replace("\n", " ")
+                    f.write(f"| {idx} | {row['binary']} | `{row['va']}` | `{row['offset']}` | `{row['type']}` | {row['length']} | `{v_esc}` |\n")
+        print(f"\n  \033[1;32m[✓] 完整字符串报表已成功导出至: {out_p}\033[0m\n")
+
+
 if __name__ == "__main__":
     main()
+

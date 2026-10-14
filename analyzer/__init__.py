@@ -15,6 +15,7 @@ from .tracer_generator import TracerGenerator
 from .sig_maker import SigMaker, SigMatchResult
 from .cfg_analyzer import CFGAnalyzer, ControlFlowGraph, BasicBlock
 from .patcher import BinaryPatcher, PatchItem
+from .string_extractor import StringExtractor, StringItem
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -48,6 +49,8 @@ __all__ = [
     "BasicBlock",
     "BinaryPatcher",
     "PatchItem",
+    "StringExtractor",
+    "StringItem",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",

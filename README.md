@@ -112,6 +112,10 @@ python3 analyze.py -f Messenger.ipa --cfg 0x908bc --export-cfg ./cfg_flow.md
 # 语法支持: <Offset/Symbol>:<NOP|RET|RET_TRUE|RET_FALSE|0xHex>
 python3 analyze.py -f Messenger.ipa --patch "0x746D90:NOP,0x47A68:RET_TRUE" --patch-output ./Messenger_patched --patch-script ./mem_patch.js
 
+# 14. 结构化字符串与 CoreFoundation 常量字典提取 (纯静态解析 __cfstring / 宽字符 UString，突破盲猜关键词)
+python3 analyze.py -f Messenger.ipa --dump-strings
+python3 analyze.py -f Messenger.ipa --dump-strings task --string-type cfstring --strings-output ./task_strings.json
+
 ```
 
 #### 覆盖的检测维度：
@@ -212,6 +216,7 @@ frida-ios-dump/
 │   ├── sig_maker.py            # [阶段一] 跨版本函数特征码生成与自动对齐器
 │   ├── cfg_analyzer.py         # [阶段二] 控制流图基本块切分与 Mermaid 可视化
 │   ├── patcher.py              # [阶段三] 指令热修补与 Frida 运行时 Patch 派生器
+│   ├── string_extractor.py     # 结构化 CFString 与宽字符 UString 常量字典提取器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器
