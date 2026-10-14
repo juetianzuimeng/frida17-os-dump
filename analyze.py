@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyzer import (
     IPAParser,
+    AppPackageInfo,
     AnalysisEngine,
     ConsoleReporter,
     JSONReporter,
@@ -29,6 +30,7 @@ from analyzer import (
     HTMLReporter,
     TweakGenerator
 )
+
 
 
 def parse_args():
@@ -264,6 +266,26 @@ def parse_args():
         help="将熵值扫描报表导出为文件 (.json / .md)"
     )
     parser.add_argument(
+        "--dump-syscalls",
+        dest="dump_syscalls_kw",
+        nargs="?",
+        const="",
+        default=None,
+        help="深度扫描底层系统调用 (Direct Syscall svc 0x80) 与反 Hook 内联汇编 (可选过滤关键词，如: --dump-syscalls 或 --dump-syscalls ptrace)"
+    )
+    parser.add_argument(
+        "--syscalls-output",
+        dest="syscalls_output_file",
+        default=None,
+        help="将底层系统调用扫描报表导出为文件 (.json / .md)"
+    )
+    parser.add_argument(
+        "--gen-syscall-patch",
+        dest="gen_syscall_patch_file",
+        default=None,
+        help="一键导出将高危 Direct Syscall 陷阱 NOP 掉的 Frida 内存热补丁 JS 脚本路径"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -384,6 +406,15 @@ def main():
         # 3.16. 滑动窗口香农熵 (Entropy) 混淆与加密扫描 (REA BinaryEntropyProfiler)
         if args.scan_entropy:
             handle_entropy(pkg_info, threshold=args.entropy_threshold, output_file=args.entropy_output_file)
+
+        # 3.17. 底层直接系统调用与反 Hook 内联汇编扫描 (REA NativeExecutionBoundaries)
+        if args.dump_syscalls_kw is not None or args.gen_syscall_patch_file:
+            handle_syscall_scan(
+                pkg_info,
+                keyword=args.dump_syscalls_kw,
+                output_file=args.syscalls_output_file,
+                patch_script_file=args.gen_syscall_patch_file
+            )
 
         # 4. 导出文件报告
         if args.output_file:
@@ -1286,8 +1317,120 @@ def handle_entropy(pkg_info, threshold: float = 7.2, output_file: Optional[str] 
         print(f"\n  \033[1;32m[✓] 完整香农熵全景报表已成功导出至: {out_p}\033[0m\n")
 
 
+def handle_syscall_scan(pkg_info: AppPackageInfo, keyword: Optional[str] = None,
+                        output_file: Optional[str] = None, patch_script_file: Optional[str] = None):
+    """
+    扫描并处理底层系统调用 (Direct Syscall svc 0x80) 与反 Hook 内联汇编
+    """
+    from analyzer.syscall_scanner import SyscallScanner, SyscallItem
+    import json
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    app_title = pkg_info.display_name or pkg_info.bundle_name or pkg_info.executable_name or os.path.basename(pkg_info.ipa_path)
+
+    kw_desc = f" (过滤关键词: '{keyword}')" if keyword else ""
+    print("\n" + "=" * 80)
+    print(f"\033[1;31m[+] 底层系统调用 (Direct Syscall svc 0x80) 与反 Hook 内联陷阱扫描{kw_desc}\033[0m")
+    print(f"  目标应用: \033[93m{app_title}\033[0m (扫描包含 {len(targets)} 个 Mach-O 模块)")
+    print("=" * 80)
+
+    all_data = []
+    total_found = 0
+    all_high_risk = []
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        scanner = SyscallScanner(bin_info.abs_path)
+        items = scanner.filter(keyword=keyword)
+        if not items:
+            continue
+
+        total_found += len(items)
+        bin_name = bin_info.name or os.path.basename(bin_info.abs_path)
+        high_risk_items = [it for it in items if it.is_anti_debug_or_security]
+        all_high_risk.extend(high_risk_items)
+
+        print(f"\n  \033[1;33m[{bin_name}]\033[0m 共发现 \033[1;36m{len(items)}\033[0m 处直接系统调用 (其中 \033[1;31m{len(high_risk_items)}\033[0m 处高危/反调试相关):")
+
+        # 展示高危或前 15 处
+        display_items = high_risk_items if high_risk_items else items[:15]
+        for idx, it in enumerate(display_items, 1):
+            sev_color = "\033[1;31m" if it.severity == "CRITICAL" else ("\033[91m" if it.severity == "HIGH" else "\033[93m")
+            num_str = f"#{it.syscall_num}" if it.syscall_num is not None else "DYNAMIC"
+            print(
+                f"    \033[90m[{idx:02d}]\033[0m {sev_color}[{it.severity:<8}]\033[0m "
+                f"\033[96mVA: {it.va_hex}\033[0m \033[90m(偏移: {it.offset_hex}, func@{it.func_hex})\033[0m -> "
+                f"\033[1m{it.syscall_name:<16}\033[0m \033[93m({num_str})\033[0m : {it.description}"
+            )
+            # 打印精简的反汇编上下文
+            if it.context_disasm:
+                print("        \033[90m上下文指令流:\033[0m")
+                for line in it.context_disasm[-3:]:
+                    print(f"          \033[37m{line}\033[0m")
+
+        if len(items) > len(display_items):
+            print(f"    \033[90m... 其余 {len(items) - len(display_items)} 项普通系统调用已折叠 (可使用 --syscalls-output 导出全量清单) ...\033[0m")
+
+        # 生成 Frida 补丁
+        if patch_script_file and high_risk_items:
+            # 针对主二进制生成补丁脚本
+            script_code = scanner.generate_frida_patch_script(high_risk_items, module_name=bin_name)
+            patch_path = os.path.abspath(patch_script_file)
+            os.makedirs(os.path.dirname(patch_path), exist_ok=True) if os.path.dirname(patch_path) else None
+            with open(patch_path, "w", encoding="utf-8") as f:
+                f.write(script_code)
+            print(f"\n    \033[1;32m[★] 针对 [{bin_name}] 的 Frida 内存热补丁脚本已导出至: {patch_path}\033[0m")
+
+        all_data.append({
+            "binary": bin_name,
+            "total_syscalls": len(items),
+            "high_risk_count": len(high_risk_items),
+            "items": [
+                {
+                    "va": it.va_hex,
+                    "offset": it.offset_hex,
+                    "func_offset": it.func_hex,
+                    "syscall_num": it.syscall_num,
+                    "syscall_name": it.syscall_name,
+                    "category": it.category,
+                    "severity": it.severity,
+                    "description": it.description,
+                    "disasm_context": it.context_disasm
+                }
+                for it in items
+            ]
+        })
+
+    if total_found == 0:
+        print(f"\n  \033[92m[✓] 未在目标代码段中扫描到符合条件的直接系统调用 (Direct Syscall svc 0x80) 指令\033[0m\n")
+
+    # 导出报表
+    if output_file and all_data:
+        out_p = os.path.abspath(output_file)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        if out_p.lower().endswith(".json"):
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(all_data, f, ensure_ascii=False, indent=2)
+        else:
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(f"# 底层直接系统调用 (Direct Syscall) 与反 Hook 陷阱审计报表\n\n")
+                f.write(f"- 目标应用: `{app_title}`\n")
+                f.write(f"- 过滤条件: `{keyword or '全部'}`\n\n")
+                for d in all_data:
+                    f.write(f"## 模块: `{d['binary']}` (共 {d['total_syscalls']} 处，高危 {d['high_risk_count']} 处)\n\n")
+                    f.write("| 序号 | 虚拟地址 (VA) | 物理偏移 | 所属函数 | 系统调用 | 级别 | 分类 | 说明 |\n")
+                    f.write("| :---: | :--- | :--- | :--- | :--- | :---: | :--- | :--- |\n")
+                    for idx, it in enumerate(d["items"], 1):
+                        num_s = f"#{it['syscall_num']}" if it['syscall_num'] is not None else "DYNAMIC"
+                        f.write(f"| {idx} | `{it['va']}` | `{it['offset']}` | `func@{it['func_offset']}` | `{it['syscall_name']} ({num_s})` | **{it['severity']}** | `{it['category']}` | {it['description']} |\n")
+                    f.write("\n")
+        print(f"\n  \033[1;32m[✓] 完整系统调用扫描报表已成功导出至: {out_p}\033[0m\n")
+
+
 if __name__ == "__main__":
     main()
+
 
 
 

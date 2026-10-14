@@ -19,6 +19,7 @@ from .string_extractor import StringExtractor, StringItem
 from .entitlements_extractor import EntitlementsExtractor, EntitlementsSummary
 from .dependency_auditor import DependencyAuditor, DependencyReport, DylibItem
 from .entropy_scanner import EntropyScanner, EntropyReport, EntropySpike, SectionEntropy
+from .syscall_scanner import SyscallScanner, SyscallItem
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -63,6 +64,8 @@ __all__ = [
     "EntropyReport",
     "EntropySpike",
     "SectionEntropy",
+    "SyscallScanner",
+    "SyscallItem",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",
@@ -72,3 +75,4 @@ __all__ = [
     "HTMLReporter",
     "TweakGenerator"
 ]
+

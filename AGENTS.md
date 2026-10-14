@@ -47,6 +47,9 @@
   - 滑动窗口香农熵 (Entropy) 扫描 (定位白盒加密密钥表与混淆块):
     - 终端扫描高熵块: `python3 analyze.py -f <target.ipa> --entropy [--entropy-threshold 7.2]`
     - 导出报表: `python3 analyze.py -f <target.ipa> --entropy --entropy-output entropy.md`
+  - 底层系统调用 (Direct Syscall `svc 0x80`) 与反 Hook 内联汇编探测 (锁定隐藏内核直调并派生 Frida 内存补丁):
+    - 终端扫描系统调用: `python3 analyze.py -f <target.ipa> --dump-syscalls [Keyword]`
+    - 导出报表与自动派生 Frida 绕过脚本: `python3 analyze.py -f <target.ipa> --dump-syscalls ptrace --syscalls-output syscalls.md --gen-syscall-patch bypass.js`
 - **触发时机**: 
   1. 面对全新 App 的“摸底”阶段：探测应用是否有**反调试 (ptrace/sysctl)**、**越狱检测**、**强 SSL Pinning** 或对 **Frida 的查杀**；静态报告会自动标识特征被哪个函数引用 (`func@0x...`)；
   2. **逆向业务协议或符号被 strip 剥离时**：需要快速掌握 App 内部有哪些 Controller、Manager、Service，或寻找特定业务关键字（如 `Message`、`Session`、`Socket`、`Crypto`）的类名与方法签名时；
@@ -60,9 +63,11 @@
   10. **面对未知或去符号大模块摸底时**：通过 `--dump-strings [keyword]` 提取全量结构化 CFString 与宽字符 UString，快速获取协议任务名、配置项或路由常量，拿其 VA 作为线索输入 `--xrefs` 形成闭环；
   11. **需定位真机 Keychain 共享组或 AppGroup 沙盒数据库路径时**：通过 `--dump-entitlements` 离线秒级提取 Mach-O 中的特权清单，无需开机即可明确 `keychain-access-groups` 与 `application-groups`；
   12. **需摸底应用动态库依赖拓扑或通信栈底层符号时**：通过 `--dump-deps` 离线秒级提取全部 `LC_LOAD_DYLIB` 与 Undefined 导入符号，掌握网络、加密与多线程基础库选型；
-  13. **面对白盒加固、高混淆或寻找内嵌加密密钥表时**：通过 `--entropy` 扫描滑动窗口香农熵，快速发现异常高熵区间 (H >= 7.2)，定位白盒密钥表、S-Box 或 OLLVM 混淆区域。
+  13. **面对白盒加固、高混淆或寻找内嵌加密密钥表时**：通过 `--entropy` 扫描滑动窗口香农熵，快速发现异常高熵区间 (H >= 7.2)，定位白盒密钥表、S-Box 或 OLLVM 混淆区域；
+  14. **需排查应用是否使用内联 `svc 0x80` 绕过符号表直接进行反调试或私有系统探测时**：通过 `--dump-syscalls [keyword]` 扫描全量 Direct Syscall，精准回溯 X16 系统调用号，并通过 `--gen-syscall-patch <file.js>` 一键派生 Frida NOP 内存热补丁。
 - **AI 行动指南**: 
   - 给它喂入砸壳后的 IPA，工具会自动解析 `__objc_classlist`、`__objc_catlist` 并建立 ARM64 指令 xrefs；
+  - 若需要排查隐藏底层内联反调试与直接穿透内核调用，运行 `python3 analyze.py -f <target.ipa> --dump-syscalls` 并派生 Frida 绕过脚本；
   - 若需要探测白盒密钥、混淆块与高熵加密数据，运行 `python3 analyze.py -f <target.ipa> --entropy`；
   - 若需要摸底动态库依赖拓扑与通信底座选型，运行 `python3 analyze.py -f <target.ipa> --dump-deps`；
   - 若需要提取应用沙盒权限与 Keychain 访问组，运行 `python3 analyze.py -f <target.ipa> --dump-entitlements`；
@@ -75,6 +80,7 @@
   - 若需要迁移新版本偏移，运行 `python3 analyze.py -f <old.ipa> --gen-sig <Offset>`，并在新版本上执行 `--find-sig "<pattern>"` 自动化更新代码；
   - 若需要强行绕过检测或测试逻辑分支，运行 `python3 analyze.py -f <target.ipa> --patch "<Offset>:RET_TRUE" --patch-script patch.js` 快速上机生效；
   - 若需要立刻上机验证，运行 `python3 analyze.py -f <target.ipa> --gen-trace <Offset> -o trace.js` 生成探针并挂钩目标 App。
+
 
 ### 3. Tweak 越狱插件自动生成 (Tweak Scaffolding)
 - **调用脚本**: `python3 gen_tweak.py -f <target.ipa> -o ./<App>Bypass`

@@ -128,7 +128,12 @@ python3 analyze.py -f Messenger.ipa --dump-deps --deps-output ./deps_report.md
 python3 analyze.py -f Messenger.ipa --entropy
 python3 analyze.py -f Messenger.ipa --entropy --entropy-threshold 7.2 --entropy-output ./entropy_report.md
 
+# 18. 底层系统调用 (Direct Syscall svc 0x80) 与反 Hook 内联汇编探测 (精准回溯 X16 系统调用号并自动派生 Frida 内存热补丁)
+python3 analyze.py -f Messenger.ipa --dump-syscalls
+python3 analyze.py -f Messenger.ipa --dump-syscalls ptrace --syscalls-output ./syscalls.md --gen-syscall-patch ./bypass_syscalls.js
+
 ```
+
 
 #### 覆盖的检测维度：
 - **反调试 (Anti-Debug)**: `ptrace (PT_DENY_ATTACH)`, `sysctl (P_TRACED/kinfo_proc)`, `task_get_exception_ports`, `SIGTRAP`, `getppid`, `isatty`, `DYLD_INSERT_LIBRARIES`
@@ -232,6 +237,7 @@ frida-ios-dump/
 │   ├── entitlements_extractor.py # 原生沙盒特权 (Entitlements) 与签名元数据提取器
 │   ├── dependency_auditor.py   # 动态链接库依赖拓扑树与导入符号审计器
 │   ├── entropy_scanner.py      # 二进制香农熵 (Entropy) 与混淆/密钥区探测器
+│   ├── syscall_scanner.py      # 底层系统调用 (Direct Syscall) 与内联汇编探测器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器
