@@ -150,6 +150,18 @@ def parse_args():
         help="将函数调用拓扑树导出为 Markdown Mermaid 流程图文件 (例如: callgraph.md)"
     )
     parser.add_argument(
+        "--gen-sig",
+        dest="gen_sig_target",
+        default=None,
+        help="提取跨版本鲁棒特征码 (Pattern Signature) (如: --gen-sig 0x746D90)"
+    )
+    parser.add_argument(
+        "--find-sig",
+        dest="find_sig_pattern",
+        default=None,
+        help="在目标二进制中检索特征码 (支持 '??' 通配符) (如: --find-sig 'FD 7B BE A9 ?? ?? ?? ?? E0 03 18 AA')"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -234,6 +246,12 @@ def main():
         # 3.9. Frida 动态追踪探针一键派生
         if args.gen_trace_targets:
             handle_gen_trace(pkg_info, args.gen_trace_targets, args.trace_output_path)
+
+        # 3.10. 跨版本特征码制作与检索
+        if args.gen_sig_target:
+            handle_gen_sig(pkg_info, args.gen_sig_target)
+        if args.find_sig_pattern:
+            handle_find_sig(pkg_info, args.find_sig_pattern)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -614,6 +632,79 @@ def handle_gen_trace(pkg_info, targets_str: str, output_path: str = None):
         print("\033[90m// Frida 探针 JS 脚本代码 (可保存为 .js 使用):\033[0m\n")
         print(full_script)
         print("-" * 80 + "\n")
+
+
+def handle_gen_sig(pkg_info, target_str: str):
+    """为指定函数提取跨版本鲁棒特征码 (Pattern Signature)"""
+    from analyzer.sig_maker import SigMaker
+    from analyzer.disassembler import Disassembler
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;35m[+] ARM64 函数跨版本特征码制作 (SigMaker) — 目标: '{target_str}'\033[0m")
+    print("=" * 80)
+
+    found = 0
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        sm = SigMaker(bin_info.abs_path)
+        dis = Disassembler(bin_info.abs_path)
+
+        resolved_list = dis.resolve_target(target_str)
+        if not resolved_list:
+            continue
+
+        for label, va in resolved_list[:3]:
+            pat, mask, count = sm.generate_signature(va)
+            if not pat:
+                continue
+
+            print(f"\n  \033[93m[{bin_info.name}]\033[0m \033[1;32m→ 目标: func@0x{va:X} ({label})\033[0m")
+            print(f"      \033[94m[IDA / YARA Pattern]:\033[0m  \033[1m{pat}\033[0m")
+            print(f"      \033[90m[Mask String]:\033[0m         {mask}")
+            print(f"      \033[90m[当前包匹配数]:\033[0m       {count} 处 ({'唯一精准匹配' if count == 1 else '多处匹配'})")
+            found += 1
+
+    if found == 0:
+        print(f"\033[90m  未能解析目标地址或提取到有效特征码。\033[0m")
+    print("\n" + "=" * 80 + "\n")
+
+
+def handle_find_sig(pkg_info, pattern: str):
+    """在目标二进制中检索特征码并定位函数"""
+    from analyzer.sig_maker import SigMaker
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;32m[+] ARM64 跨版本特征码检索 (Pattern Matcher) — 模式: '{pattern}'\033[0m")
+    print("=" * 80)
+
+    total_hits = 0
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        sm = SigMaker(bin_info.abs_path)
+        matches = sm.find_signature(pattern)
+        if not matches:
+            continue
+
+        print(f"\n  \033[93m[{bin_info.name}]\033[0m 命中 \033[1;32m{len(matches)}\033[0m 处位置:")
+        for i, m in enumerate(matches[:10], 1):
+            print(
+                f"      \033[96m[{i:02d}] 虚拟地址 (VA): 0x{m.va:X}\033[0m"
+                f"  \033[90m(文件偏移: 0x{m.file_offset:X})\033[0m"
+                f"  \033[1;33mHex: {m.matched_hex[:36]}...\033[0m"
+            )
+        if len(matches) > 10:
+            print(f"      \033[90m... 还有 {len(matches) - 10} 处匹配未列出\033[0m")
+        total_hits += len(matches)
+
+    if total_hits == 0:
+        print(f"\033[90m  未在二进制中匹配到该特征码。\033[0m")
+    print("\n" + "=" * 80 + "\n")
 
 
 if __name__ == "__main__":
