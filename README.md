@@ -120,6 +120,10 @@ python3 analyze.py -f Messenger.ipa --dump-strings task --string-type cfstring -
 python3 analyze.py -f Messenger.ipa --dump-entitlements
 python3 analyze.py -f Messenger.ipa --dump-entitlements --entitlements-output ./entitlements.plist
 
+# 16. 动态链接库依赖拓扑与导入符号审计 (纯静态解析 LC_LOAD_DYLIB 与 LC_SYMTAB，摸底通信网络与安全API选型)
+python3 analyze.py -f Messenger.ipa --dump-deps
+python3 analyze.py -f Messenger.ipa --dump-deps --deps-output ./deps_report.md
+
 ```
 
 #### 覆盖的检测维度：
@@ -222,6 +226,7 @@ frida-ios-dump/
 │   ├── patcher.py              # [阶段三] 指令热修补与 Frida 运行时 Patch 派生器
 │   ├── string_extractor.py     # 结构化 CFString 与宽字符 UString 常量字典提取器
 │   ├── entitlements_extractor.py # 原生沙盒特权 (Entitlements) 与签名元数据提取器
+│   ├── dependency_auditor.py   # 动态链接库依赖拓扑树与导入符号审计器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器

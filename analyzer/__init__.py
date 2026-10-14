@@ -17,6 +17,7 @@ from .cfg_analyzer import CFGAnalyzer, ControlFlowGraph, BasicBlock
 from .patcher import BinaryPatcher, PatchItem
 from .string_extractor import StringExtractor, StringItem
 from .entitlements_extractor import EntitlementsExtractor, EntitlementsSummary
+from .dependency_auditor import DependencyAuditor, DependencyReport, DylibItem
 from .engine import AnalysisEngine, AnalysisResult, AnalysisSummary
 from .reporter import ConsoleReporter, JSONReporter, MarkdownReporter, HTMLReporter
 from .tweak_generator import TweakGenerator
@@ -54,6 +55,9 @@ __all__ = [
     "StringItem",
     "EntitlementsExtractor",
     "EntitlementsSummary",
+    "DependencyAuditor",
+    "DependencyReport",
+    "DylibItem",
     "AnalysisEngine",
     "AnalysisResult",
     "AnalysisSummary",

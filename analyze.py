@@ -233,6 +233,18 @@ def parse_args():
         help="将提取的沙盒特权导出为文件 (.plist / .xml / .json)"
     )
     parser.add_argument(
+        "--dump-deps",
+        dest="dump_deps",
+        action="store_true",
+        help="解析 Mach-O 动态库依赖拓扑树 (LC_LOAD_DYLIB) 与外部导入符号 (LC_SYMTAB)"
+    )
+    parser.add_argument(
+        "--deps-output",
+        dest="deps_output_file",
+        default=None,
+        help="将依赖拓扑与导入符号报表导出为文件 (.json / .md)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -345,6 +357,10 @@ def main():
         # 3.14. 原生沙盒特权 (Entitlements) 静态提取 (REA BinaryMetadataProvider)
         if args.dump_entitlements:
             handle_dump_entitlements(pkg_info, args.entitlements_output_file)
+
+        # 3.15. 动态库依赖拓扑与导入符号审计 (REA ApplicationGraphProjector)
+        if args.dump_deps:
+            handle_dump_deps(pkg_info, args.deps_output_file)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -972,9 +988,10 @@ def handle_dump_strings(
             with open(out_p, "w", encoding="utf-8") as f:
                 json.dump(total_extracted_all, f, ensure_ascii=False, indent=2)
         else:
+            app_title = pkg_info.display_name or pkg_info.bundle_name or pkg_info.executable_name or os.path.basename(pkg_info.ipa_path)
             with open(out_p, "w", encoding="utf-8") as f:
                 f.write(f"# 结构化字符串与常量导出报表\n\n")
-                f.write(f"- 目标文件: `{pkg_info.name}`\n")
+                f.write(f"- 目标文件: `{app_title}`\n")
                 f.write(f"- 匹配项总数: {len(total_extracted_all)}\n\n")
                 f.write("| 序号 | 模块 | 虚拟地址 (VA) | 物理偏移 | 类型 | 长度 | 常量内容 |\n")
                 f.write("| :---: | :--- | :--- | :--- | :--- | :---: | :--- |\n")
@@ -1063,7 +1080,98 @@ def handle_dump_entitlements(pkg_info, output_file: Optional[str] = None):
         print(f"\n  \033[1;32m[✓] 沙盒特权原件已成功导出至: {out_p}\033[0m\n")
 
 
+def handle_dump_deps(pkg_info, output_file: Optional[str] = None):
+    """处理 Mach-O 动态库依赖拓扑树与导入符号分析"""
+    import json
+    from analyzer.dependency_auditor import DependencyAuditor
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    app_title = pkg_info.display_name or pkg_info.bundle_name or pkg_info.executable_name or os.path.basename(pkg_info.ipa_path)
+    print("\n" + "=" * 80)
+    print(f"\033[1;34m[+] 动态库依赖拓扑与导入符号审计 (Dependency & Import Auditor)\033[0m")
+    print(f"  目标应用: \033[93m{app_title}\033[0m (扫描包含 {len(targets)} 个 Mach-O 模块)")
+    print("=" * 80)
+
+    all_reports = []
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        auditor = DependencyAuditor(bin_info.abs_path)
+        report = auditor.audit()
+        if not report:
+            continue
+
+        print(f"\n  \033[1;33m[{report.binary_name}]\033[0m")
+        # 1. 动态库依赖
+        sys_dylibs = [d for d in report.dylibs if d.is_system]
+        custom_dylibs = [d for d in report.dylibs if not d.is_system]
+        print(f"    • \033[96m动态链接库拓扑\033[0m ({len(report.dylibs)} 个依赖):")
+        if custom_dylibs:
+            print(f"        \033[95m[应用内部 / 第三方 Frameworks] ({len(custom_dylibs)} 个):\033[0m")
+            for d in custom_dylibs:
+                link_tag = f"\033[91m[{d.link_type}]\033[0m" if d.link_type != "LOAD" else ""
+                print(f"          \033[92m- {d.path}\033[0m {link_tag}")
+        if sys_dylibs:
+            print(f"        \033[90m[系统公共库 System/usr] ({len(sys_dylibs)} 个):\033[0m")
+            for d in sys_dylibs[:8]:
+                print(f"          \033[90m- {d.display_name} ({d.path})\033[0m")
+            if len(sys_dylibs) > 8:
+                print(f"          \033[90m... 其余 {len(sys_dylibs) - 8} 个系统库已折叠 ...\033[0m")
+
+        # 2. 核心分类 API
+        if report.categorized_apis:
+            print(f"    • \033[96m导入的核心业务 API 分类\033[0m:")
+            for cat_name, apis in report.categorized_apis.items():
+                print(f"        \033[93m[{cat_name}]\033[0m ({len(apis)} 个符号):")
+                preview = ", ".join(f"\033[1m{a}\033[0m" for a in apis[:6])
+                suffix = f" ...等共 {len(apis)} 项" if len(apis) > 6 else ""
+                print(f"          {preview}{suffix}")
+
+        # 3. 导入外部 ObjC 类
+        if report.imported_classes:
+            print(f"    • \033[96m外部导入 Objective-C 类\033[0m ({len(report.imported_classes)} 个类):")
+            cls_preview = ", ".join(f"\033[94m{c}\033[0m" for c in report.imported_classes[:10])
+            cls_suffix = f" ...等共 {len(report.imported_classes)} 个类" if len(report.imported_classes) > 10 else ""
+            print(f"        {cls_preview}{cls_suffix}")
+
+        all_reports.append({
+            "binary": report.binary_name,
+            "dylibs": [{"path": d.path, "type": d.link_type, "system": d.is_system} for d in report.dylibs],
+            "rpaths": report.rpaths,
+            "imported_classes": report.imported_classes,
+            "categorized_apis": report.categorized_apis,
+            "total_imported_symbols_count": len(report.imported_symbols)
+        })
+
+    # 导出文件
+    if output_file and all_reports:
+        out_p = os.path.abspath(output_file)
+        os.makedirs(os.path.dirname(out_p), exist_ok=True) if os.path.dirname(out_p) else None
+        if out_p.lower().endswith(".json"):
+            with open(out_p, "w", encoding="utf-8") as f:
+                json.dump(all_reports, f, ensure_ascii=False, indent=2)
+            app_title = pkg_info.display_name or pkg_info.bundle_name or pkg_info.executable_name or os.path.basename(pkg_info.ipa_path)
+            with open(out_p, "w", encoding="utf-8") as f:
+                f.write(f"# 动态库依赖与导入符号全景审计报表\n\n")
+                f.write(f"- 目标应用: `{app_title}`\n\n")
+                for r in all_reports:
+                    f.write(f"## 模块: `{r['binary']}`\n\n")
+                    f.write(f"### 1. 动态链接库清单\n\n")
+                    for d in r["dylibs"]:
+                        f.write(f"- `{d['type']}`: {d['path']}\n")
+                    f.write(f"\n### 2. 外部导入类数量: {len(r['imported_classes'])}\n\n")
+                    f.write(f"### 3. 核心业务分类 API\n\n")
+                    for c_name, c_apis in r["categorized_apis"].items():
+                        f.write(f"#### {c_name}\n")
+                        for a in c_apis:
+                            f.write(f"- `{a}`\n")
+                        f.write("\n")
+        print(f"\n  \033[1;32m[✓] 完整依赖拓扑与导入符号报表已成功导出至: {out_p}\033[0m\n")
+
+
 if __name__ == "__main__":
     main()
+
 
 
