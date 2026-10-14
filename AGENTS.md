@@ -26,19 +26,34 @@
     - 查它调用了谁 (下游子调用树): `python3 analyze.py -f <target.ipa> --callees <Offset/Symbol> [--depth 2] [--export-mermaid callgraph.md]`
   - 静态一键派生 Frida 动态追踪探针: `python3 analyze.py -f <target.ipa> --gen-trace <Offset1,Offset2> [--trace-output trace.js]`
   - 独立 Swift & C++ (Itanium ABI) 符号秒级还原: `python3 analyze.py --demangle <MangledSymbol>`
+  - [阶段一] 跨版本函数特征码生成与秒级自动对齐: 
+    - 提取特征: `python3 analyze.py -f <target.ipa> --gen-sig <Offset/Symbol>`
+    - 跨版本对齐: `python3 analyze.py -f <new_target.ipa> --find-sig "<Pattern>"`
+  - [阶段二] 函数控制流图 (CFG) 基本块切分与 Mermaid 可视化:
+    - 终端拓扑解析: `python3 analyze.py -f <target.ipa> --cfg <Offset/Symbol>`
+    - 导出 Mermaid 图: `python3 analyze.py -f <target.ipa> --cfg <Offset/Symbol> --export-cfg <file.md>`
+  - [阶段三] ARM64 指令热修补与 Frida 运行时 Patch 派生:
+    - 静态修补二进制: `python3 analyze.py -f <target.ipa> --patch "<Offset/Symbol>:<Action>" [--patch-output <file>]`
+    - 导出免改原文件 Frida 内存热补丁: `python3 analyze.py -f <target.ipa> --patch "<Offset/Symbol>:<Action>" --patch-script <file.js>`
 - **触发时机**: 
   1. 面对全新 App 的“摸底”阶段：探测应用是否有**反调试 (ptrace/sysctl)**、**越狱检测**、**强 SSL Pinning** 或对 **Frida 的查杀**；静态报告会自动标识特征被哪个函数引用 (`func@0x...`)；
   2. **逆向业务协议或符号被 strip 剥离时**：需要快速掌握 App 内部有哪些 Controller、Manager、Service，或寻找特定业务关键字（如 `Message`、`Session`、`Socket`、`Crypto`）的类名与方法签名时；
   3. **定位敏感调用点以实施精确 Hook 时**：通过 `--xrefs <keyword>` 秒级反查引用该特征的汇编函数偏移 (`caller_func_offset`)，免去在 IDA 中手动交叉引用的繁琐操作；
   4. **深入判断函数底层实现（免开 IDA / Hopper）**：拿到函数偏移或发现特征后，通过 `--disasm <Offset/Symbol>` 直接截取该函数的 ARM64 汇编指令片段（带字符串常量内联注释与系统调用识别），秒级掌握该函数的具体逻辑与返回时机；
   5. **梳理调用链与核心业务主路径**：通过 `--callers` 快速理清某底层 API 是由哪些业务函数调起（回溯触发源），通过 `--callees` 顺藤摸瓜掌握该函数内部按序触发的子任务（理清算法分发流程）；
-  6. **快速进入真机动态验证闭环**：通过 `--gen-trace <Offsets>` 一键生成具备自动 ASLR 基址重定位、智能入参嗅探、调用栈打印与耗时统计的 Frida 探针，直接上机验证。
+  6. **快速进入真机动态验证闭环**：通过 `--gen-trace <Offsets>` 一键生成具备自动 ASLR 基址重定位、智能入参嗅探、调用栈打印与耗时统计的 Frida 探针，直接上机验证；
+  7. **面对跨版本发版导致硬编码偏移失效时**：通过 `--gen-sig` 提取核心函数指令序列并自动遮罩动态操作数，再通过 `--find-sig` 在新版 IPA 中秒级自动对齐新偏移，实现 Hook 脚本与逆向成果的零成本迁移；
+  8. **分析复杂状态机、分支跳转与多返回路径函数时**：通过 `--cfg` 自动切分汇编基本块并导出 Mermaid 控制流图，一眼洞悉循环结构、跳出条件与异常分支；
+  9. **需强行绕过特定条件判断、反调试或强行置位时**：通过 `--patch <Target>:NOP/RET_TRUE` 静态生成修补后的二进制，或一键导出 Frida 内存热修补脚本（动态 `Memory.protect` 修改执行权限并写入机器码），无需重新打包安装即可立即测试。
 - **AI 行动指南**: 
   - 给它喂入砸壳后的 IPA，工具会自动解析 `__objc_classlist`、`__objc_catlist` 并建立 ARM64 指令 xrefs；
   - 若需要定位特定业务类，运行 `python3 analyze.py -f <target.ipa> --dump-objc <Keyword>` 快速打印 `@interface` 结构（含 Swift 还原标签）；
   - 若需要定位反调试/防护逻辑执行体，运行 `python3 analyze.py -f <target.ipa> --xrefs <keyword>` 提取调用者函数 Offset；
   - 若需要快速研判函数控制流，运行 `python3 analyze.py -f <target.ipa> --disasm <Offset>` 查看汇编实现，快速决定 Hook 点或 Patch 策略；
   - 若需要回溯业务调用链路，运行 `python3 analyze.py -f <target.ipa> --callers <Offset>` 或 `--callees <Offset>` 快速建立调用图；
+  - 若需要分析复杂函数的完整逻辑走向，运行 `python3 analyze.py -f <target.ipa> --cfg <Offset> --export-cfg cfg.md` 可视化控制流分支；
+  - 若需要迁移新版本偏移，运行 `python3 analyze.py -f <old.ipa> --gen-sig <Offset>`，并在新版本上执行 `--find-sig "<pattern>"` 自动化更新代码；
+  - 若需要强行绕过检测或测试逻辑分支，运行 `python3 analyze.py -f <target.ipa> --patch "<Offset>:RET_TRUE" --patch-script patch.js` 快速上机生效；
   - 若需要立刻上机验证，运行 `python3 analyze.py -f <target.ipa> --gen-trace <Offset> -o trace.js` 生成探针并挂钩目标 App。
 
 ### 3. Tweak 越狱插件自动生成 (Tweak Scaffolding)

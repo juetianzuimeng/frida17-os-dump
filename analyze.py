@@ -174,6 +174,24 @@ def parse_args():
         help="将函数控制流图 (CFG) 导出为 Markdown Mermaid 流程图文件 (例如: cfg.md)"
     )
     parser.add_argument(
+        "--patch",
+        dest="patch_specs",
+        default=None,
+        help="对指定目标执行 ARM64 指令热修补 (如: --patch 0x1E9B34:NOP 或 0x47A68:RET_TRUE)"
+    )
+    parser.add_argument(
+        "--patch-output",
+        dest="patch_output_file",
+        default=None,
+        help="指定打好静态补丁的新二进制文件输出路径 (未指定则默认保存为 <file>.patched)"
+    )
+    parser.add_argument(
+        "--patch-script",
+        dest="patch_script_file",
+        default=None,
+        help="导出免修改原文件的 Frida 运行时内存热补丁 JS 脚本路径 (如: mem_patch.js)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -268,6 +286,10 @@ def main():
         # 3.11. 控制流图 (CFG) 分析与 Mermaid 导出
         if args.cfg_target:
             handle_cfg(pkg_info, args.cfg_target, args.export_cfg_path)
+
+        # 3.12. 指令静态热修补与 Frida 内存 Patch 派生
+        if args.patch_specs:
+            handle_patch(pkg_info, args.patch_specs, args.patch_output_file, args.patch_script_file)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -773,6 +795,58 @@ def handle_cfg(pkg_info, target_str: str, export_path: str = None):
     if found == 0:
         print(f"\033[90m  未能解析目标地址或构建控制流图。\033[0m")
     print("\n" + "=" * 80 + "\n")
+
+
+def handle_patch(pkg_info, patch_specs: str, patch_output: str = None, patch_script: str = None):
+    """处理 ARM64 指令静态补丁与 Frida 动态内存热修补"""
+    from analyzer.patcher import BinaryPatcher
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+    spec_list = [s.strip() for s in patch_specs.split(",") if s.strip()]
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;31m[+] ARM64 指令热修补与 Frida 运行时 Patch (Binary & Memory Patcher)\033[0m")
+    print(f"  补丁任务列表: {spec_list}")
+    print("=" * 80)
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        patcher = BinaryPatcher(bin_info.abs_path)
+        parsed_items = []
+        for spec in spec_list:
+            item = patcher.parse_patch_spec(spec)
+            if item:
+                parsed_items.append(item)
+
+        if not parsed_items:
+            continue
+
+        print(f"\n  \033[93m[{bin_info.name}]\033[0m 锁定 \033[1;32m{len(parsed_items)}\033[0m 处有效修补点:")
+        for i, item in enumerate(parsed_items, 1):
+            orig_hex = " ".join(f"{b:02X}" for b in item.original_bytes)
+            patch_hex = " ".join(f"{b:02X}" for b in item.patch_bytes)
+            print(
+                f"      \033[96m[{i:02d}] 目标: {item.target_raw}\033[0m  \033[90m(偏移: 0x{item.file_offset:X})\033[0m\n"
+                f"          原始机器码: \033[91m{orig_hex}\033[0m\n"
+                f"          替换机器码: \033[92m{patch_hex}\033[0m  \033[1;33m[{item.description}]\033[0m"
+            )
+
+        # 1. 执行静态二进制 Patch
+        out_file, applied = patcher.apply_patch(parsed_items, output_path=patch_output)
+        print(f"\n  \033[1;32m[✓] 静态修补二进制已保存至: {out_file}\033[0m")
+        print(f"      \033[90m(原始文件已安全备份为: {bin_info.abs_path}.bak)\033[0m")
+
+        # 2. 导出 Frida 内存热补丁脚本
+        if patch_script:
+            frida_js = patcher.generate_frida_patch_script(bin_info.name, applied)
+            s_path = os.path.abspath(patch_script)
+            os.makedirs(os.path.dirname(s_path), exist_ok=True) if os.path.dirname(s_path) else None
+            with open(s_path, "w", encoding="utf-8") as f:
+                f.write(frida_js)
+            print(f"  \033[1;32m[✓] Frida 动态内存热补丁脚本已导出至: {s_path}\033[0m")
+            bundle_id = pkg_info.bundle_id or "<BundleID>"
+            print(f"      \033[93m建议启动命令:\033[0m \033[1mfrida -U -f {bundle_id} -l {patch_script} --no-pause\033[0m\n")
 
 
 if __name__ == "__main__":

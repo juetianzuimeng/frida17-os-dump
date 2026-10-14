@@ -99,6 +99,19 @@ python3 analyze.py -f Messenger.ipa --callees 0x746D90 --depth 2 --export-mermai
 
 # 10. 静态分析一键派生 Frida 动态追踪探针脚本 (自动生成带入参探测、准确调用栈与耗时统计的 JS 探针)
 python3 analyze.py -f Messenger.ipa --gen-trace 0x746D90,0x47A68 --trace-output ./trace_demo.js
+
+# 11. [阶段一] 跨版本函数特征码生成与秒级自动对齐 (突破发版偏移失效，11ms 锁定 26MB 动态库同源函数)
+python3 analyze.py -f Messenger.ipa --gen-sig 0x746D90
+python3 analyze.py -f Messenger_v2.ipa --find-sig "FD 7B BE A9 FD 03 00 91 F4 4F 01 A9 . . . 97"
+
+# 12. [阶段二] 函数控制流图 (CFG) 基本块切分与 Mermaid 流程图导出 (透视复杂逻辑跳转与基本块拓扑)
+python3 analyze.py -f Messenger.ipa --cfg 0x908bc
+python3 analyze.py -f Messenger.ipa --cfg 0x908bc --export-cfg ./cfg_flow.md
+
+# 13. [阶段三] ARM64 指令热修补与 Frida 运行时 Patch (静态二进制 Patch 与免改原文件 Frida 内存热补丁)
+# 语法支持: <Offset/Symbol>:<NOP|RET|RET_TRUE|RET_FALSE|0xHex>
+python3 analyze.py -f Messenger.ipa --patch "0x746D90:NOP,0x47A68:RET_TRUE" --patch-output ./Messenger_patched --patch-script ./mem_patch.js
+
 ```
 
 #### 覆盖的检测维度：
@@ -193,6 +206,12 @@ frida-ios-dump/
 ├── analyzer/                   # 核心分析与扫描引擎库
 │   ├── ipa_parser.py           # IPA 解包与资源解析
 │   ├── macho_parser.py         # Mach-O 二进制结构/符号提取
+│   ├── xref_scanner.py         # ARM64 交叉引用与静态反汇编引擎
+│   ├── call_graph.py           # 函数多级调用图与递归拓扑追溯器
+│   ├── tracer_generator.py     # Frida 动态追踪探针脚本自动派生器
+│   ├── sig_maker.py            # [阶段一] 跨版本函数特征码生成与自动对齐器
+│   ├── cfg_analyzer.py         # [阶段二] 控制流图基本块切分与 Mermaid 可视化
+│   ├── patcher.py              # [阶段三] 指令热修补与 Frida 运行时 Patch 派生器
 │   ├── engine.py               # 规则匹配与安全评分引擎
 │   ├── reporter.py             # 终端彩色/HTML/Markdown/JSON 报告器
 │   ├── tweak_generator.py      # Tweak 源码与 Frida 脚本组装器
