@@ -162,6 +162,18 @@ def parse_args():
         help="在目标二进制中检索特征码 (支持 '??' 通配符) (如: --find-sig 'FD 7B BE A9 ?? ?? ?? ?? E0 03 18 AA')"
     )
     parser.add_argument(
+        "--cfg",
+        dest="cfg_target",
+        default=None,
+        help="生成指定函数的 ARM64 控制流图 (CFG) 与基本块切分分析 (如: --cfg 0x908bc)"
+    )
+    parser.add_argument(
+        "--export-cfg",
+        dest="export_cfg_path",
+        default=None,
+        help="将函数控制流图 (CFG) 导出为 Markdown Mermaid 流程图文件 (例如: cfg.md)"
+    )
+    parser.add_argument(
         "--keep-temp",
         dest="keep_temp",
         action="store_true",
@@ -252,6 +264,10 @@ def main():
             handle_gen_sig(pkg_info, args.gen_sig_target)
         if args.find_sig_pattern:
             handle_find_sig(pkg_info, args.find_sig_pattern)
+
+        # 3.11. 控制流图 (CFG) 分析与 Mermaid 导出
+        if args.cfg_target:
+            handle_cfg(pkg_info, args.cfg_target, args.export_cfg_path)
 
         # 4. 导出文件报告
         if args.output_file:
@@ -704,6 +720,58 @@ def handle_find_sig(pkg_info, pattern: str):
 
     if total_hits == 0:
         print(f"\033[90m  未在二进制中匹配到该特征码。\033[0m")
+    print("\n" + "=" * 80 + "\n")
+
+
+def handle_cfg(pkg_info, target_str: str, export_path: str = None):
+    """分析 ARM64 函数控制流图 (CFG) 并可导出 Mermaid 流程图"""
+    from analyzer.cfg_analyzer import CFGAnalyzer
+    from analyzer.disassembler import Disassembler
+
+    targets = ([pkg_info.main_binary] if pkg_info.main_binary else []) + pkg_info.frameworks
+
+    print("\n" + "=" * 80)
+    print(f"\033[1;35m[+] ARM64 函数控制流图分析 (CFG) — 目标: '{target_str}'\033[0m")
+    print("=" * 80)
+
+    found = 0
+    mermaid_charts = []
+
+    for bin_info in targets:
+        if not bin_info:
+            continue
+        cfg_an = CFGAnalyzer(bin_info.abs_path)
+        dis = Disassembler(bin_info.abs_path)
+
+        resolved_list = dis.resolve_target(target_str)
+        if not resolved_list:
+            continue
+
+        for label, va in resolved_list[:3]:
+            cfg = cfg_an.analyze_function(va)
+            if not cfg.blocks:
+                continue
+
+            print(f"\n  \033[93m[{bin_info.name}]\033[0m \033[1;32m→ 控制流图:\033[0m")
+            for line in CFGAnalyzer.format_console_cfg(cfg):
+                print(f"    {line}")
+            found += 1
+
+            if export_path:
+                chart = CFGAnalyzer.format_mermaid_cfg(cfg)
+                mermaid_charts.append(chart)
+
+    if export_path and mermaid_charts:
+        out_p = os.path.abspath(export_path)
+        out_dir = os.path.dirname(out_p)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            f.write("# 函数控制流图 (CFG) Mermaid 流程图\n\n" + "\n\n".join(mermaid_charts))
+        print(f"\n\033[1;32m[+] 控制流图 Mermaid 流程图已成功保存至: {out_p}\033[0m")
+
+    if found == 0:
+        print(f"\033[90m  未能解析目标地址或构建控制流图。\033[0m")
     print("\n" + "=" * 80 + "\n")
 
 
